@@ -1,6 +1,6 @@
-# Test on every push and pull request; build wheels for every platform; publish to PyPI when a version tag (v0.1.0) is
-# pushed. PyPI uses trusted publishing (no token): the project `arrow2xmla` trusts this repository, this file and the
-# `pypi` environment.
+# Test on every push and pull request; build wheels for every platform and test them on every supported Python;
+# publish to PyPI when a version tag (v0.1.0) is pushed. PyPI uses trusted publishing (no token): the project
+# `arrow2xmla` trusts this repository, this file and the `pypi` environment.
 name: workflow
 
 on:
@@ -18,8 +18,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p arrow2xmla
-      - run: cargo clippy -p arrow2xmla -- -D warnings
+        with:
+          components: clippy
+      - run: cargo test --workspace --exclude arrow2xmla-py --all-features
+      - run: cargo test -p arrow2xmla --no-default-features
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy -p arrow2xmla --no-default-features -- -D warnings
+      - name: The tag is the crate's version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c "import json,sys; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='arrow2xmla'))")
+          test "refs/tags/v${version}" = "${GITHUB_REF}" || { echo "tag ${GITHUB_REF_NAME} is not v${version}"; exit 1; }
 
   wheels:
     needs: test
@@ -28,8 +37,9 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, target: x86_64, manylinux: auto }
-          - { os: ubuntu-latest, target: aarch64, manylinux: auto }
-          - { os: macos-13, target: x86_64 }
+          - { os: ubuntu-24.04-arm, target: aarch64, manylinux: auto }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, manylinux: musllinux_1_2 }
+          - { os: macos-15-intel, target: x86_64 }
           - { os: macos-latest, target: aarch64 }
           - { os: windows-latest, target: x64 }
     runs-on: ${{ matrix.os }}
@@ -43,8 +53,9 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist
-      - name: Test the wheel against the pure-Python reference (a platform that can run it)
-        if: ${{ !startsWith(matrix.target, 'aarch64') || matrix.os == 'macos-latest' }}
+      - name: Test the wheel against the pure-Python reference
+        # a musl wheel does not load on a glibc runner
+        if: ${{ !contains(matrix.target, 'musl') }}
         shell: bash
         run: |
           python -m pip install pytest pyarrow
@@ -54,6 +65,28 @@ jobs:
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist
+
+  # one abi3 wheel serves every Python: run it on each
+  python-versions:
+    needs: wheels
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-ubuntu-latest-x86_64
+          path: dist
+      - run: |
+          python -m pip install pytest pyarrow
+          python -m pip install --no-index --find-links dist arrow2xmla
+          python -m pytest -q
 
   sdist:
     needs: test
@@ -71,7 +104,7 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [wheels, sdist]
+    needs: [wheels, python-versions, sdist]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

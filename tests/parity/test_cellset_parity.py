@@ -117,8 +117,13 @@ def test_string_cells_and_int_types() -> None:
     cols = [(pa.array(["a&b", None, "x<y"], pa.string()), "@"), (pa.array([1, 2, None], pa.int32()), "0"), (pa.array([1.5, None, 3.0], pa.float32()), "0.0")]
     keys = ["k1", "k2", "k3"]
     light = query.LightAxis(value_member(H, "x"), None, keys)
-    py = expected(CUBE, [[measure_member("S"), ][:0] or [(value_member(H, "k1"),)]], python_cells(cols), [], [()], ("VALUE", "FORMAT_STRING"), {0: light})
-    spec = {"cube": CUBE.name, "axes": [{"level": {"template": member_dict(value_member(H, "x")), "keys": pa.array(keys)}}], "columns": cols}
+    measures = [(measure_member(n),) for n in "ABC"]
+    py = expected(CUBE, [measures, [(value_member(H, "k1"),)]], python_cells(cols), [], [(), ()], ("VALUE", "FORMAT_STRING"), {1: light})
+    spec = {
+        "cube": CUBE.name,
+        "axes": [{"tuples": [[member_dict(m) for m in t] for t in measures]}, {"level": {"template": member_dict(value_member(H, "x")), "keys": pa.array(keys)}}],
+        "columns": cols,
+    }  # fmt: skip
     check(spec, py)
 
 
@@ -180,7 +185,14 @@ def test_indexed_tuples_are_the_same_as_member_tuples() -> None:
 def test_threads_do_not_change_a_byte() -> None:
     n = 50_000
     keys = pa.array([f"k{i} & <{i}> ]" for i in range(n)])
-    spec = {"cube": "C", "axes": [{"properties": ["MEMBER_CAPTION"], "level": {"template": member_dict(value_member(H, "x")), "keys": keys}}], "columns": [(pa.array([i * 0.37 for i in range(n)]), "0"), (pa.array(range(n)), "0")]}
+    spec = {
+        "cube": "C",
+        "axes": [
+            {"tuples": [[member_dict(measure_member("A"))], [member_dict(measure_member("B"))]]},
+            {"properties": ["MEMBER_CAPTION"], "level": {"template": member_dict(value_member(H, "x")), "keys": keys}},
+        ],
+        "columns": [(pa.array([i * 0.37 for i in range(n)]), "0"), (pa.array(range(n)), "0")],
+    }  # fmt: skip
     one = cellset_xml(spec, threads=1)
     assert one == cellset_xml(spec, threads=3) == cellset_xml(spec, threads=0)
     assert b"".join(__import__("arrow2xmla").cellset_xml_chunks(spec)) == one

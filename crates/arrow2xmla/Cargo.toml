@@ -1,9 +1,13 @@
 [package]
 name = "arrow2xmla"
-description = "Write XMLA (MDDataset) cellsets straight from Apache Arrow arrays. Pure Rust, no engine or product dependencies."
+description = "Write XMLA (MDDataset) cellsets straight from columnar (Arrow) data, and parse XMLA requests. Pure Rust, no engine or product dependencies."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository = "https://github.com/bmsuisse/arrow2xmla"
+readme = "../../README.md"
+keywords = ["xmla", "arrow", "olap", "excel", "mdx"]
+categories = ["database", "encoding"]
 
 [dependencies]
 itoa = "1"

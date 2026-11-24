@@ -27,8 +27,15 @@ def md(m: ref.Member) -> dict:
 SAMPLE = ref.Member(H, f"{H}.&[x]", "x", f"{H}.[L]", 1, parent=f"{H}.[All]")
 
 
+def measure(i: int) -> ref.Member:
+    return ref.Member("[Measures]", f"[Measures].[M{i}]", f"M{i}", "[Measures].[MeasuresLevel]", 0, kind=3)
+
+
 def spec(keys: pa.Array, columns: list[tuple[pa.Array, str]], **kw: object) -> dict:
-    return {"cube": "C", "axes": [{"level": {"template": md(SAMPLE), "keys": keys}}], "columns": columns, **kw}
+    """One column: the level on the only axis. Several: the measures on columns, the level on rows."""
+    level = {"level": {"template": md(SAMPLE), "keys": keys}}
+    axes = [level] if len(columns) <= 1 else [{"tuples": [[md(measure(i))] for i in range(len(columns))]}, level]
+    return {"cube": "C", "axes": axes, "columns": columns, **kw}
 
 
 def reference(keys: pa.Array, columns: list[tuple[pa.Array, str]]) -> str:
@@ -36,7 +43,11 @@ def reference(keys: pa.Array, columns: list[tuple[pa.Array, str]]) -> str:
     cells = {r * n + k: (v, f) for k, (c, f) in enumerate(columns) for r, v in enumerate(c.to_pylist()) if v is not None}
     light = ref.LightAxis(SAMPLE, None, keys.to_pylist())
     first = ref.Member(H, ref.member_uname(H, "k"), "k", f"{H}.[L]", 1, parent=f"{H}.[All]")
-    cs = ref.Cellset(CUBE, [[(first,)] if len(keys) else []], cells, (), [()], ("VALUE", "FORMAT_STRING"), {0: light})
+    rows = [(first,)] if len(keys) else []
+    if n <= 1:
+        cs = ref.Cellset(CUBE, [rows], cells, (), [()], ("VALUE", "FORMAT_STRING"), {0: light})
+    else:
+        cs = ref.Cellset(CUBE, [[(measure(i),) for i in range(n)], rows], cells, (), [(), ()], ("VALUE", "FORMAT_STRING"), {1: light})
     return ref.cellset_xml(cs)
 
 
@@ -157,7 +168,6 @@ UNSUPPORTED = {
     "decimal128": pa.array([1, 2, None], pa.decimal128(10, 2)),
     "binary": pa.array([b"a", b"b", None]),
     "large_binary": pa.array([b"a", b"b", None], pa.large_binary()),
-    "float16": pa.array([1.0, 2.0, None], pa.float16()),
     "list": pa.array([[1], [2], None]),
     "struct": pa.array([{"a": 1}, {"a": 2}, None]),
     "null": pa.nulls(3),
@@ -256,10 +266,11 @@ def test_characters_xml_forbids_never_reach_the_answer(bad: str, typ: pa.DataTyp
     assert bad.encode() not in out
 
 
-def test_legal_whitespace_controls_are_kept() -> None:
+def test_legal_whitespace_controls_survive_a_parse() -> None:
     out = arrow2xmla.cellset_xml(spec(pa.array(["a\tb\nc\rd"]), [(pa.array(["a\tb\nc\rd"]), "@")]))
-    ET.fromstring(out)
-    assert b"a\tb\nc\rd" in out
+    root = ET.fromstring(out)
+    assert root.find(f".//{{{M}}}Cell/{{{M}}}Value").text == "a\tb\nc\rd"  # the carriage return is kept
+    assert root.find(f".//{{{M}}}Member/{{{M}}}Caption").text == "a\tb\nc\rd"
 
 
 @pytest.mark.parametrize("name", ['[T"q"].[F]', "[T'q'].[F]", "[T\"'q].[F]", "[T\n\t].[F]", "[T&<>].[F]"])

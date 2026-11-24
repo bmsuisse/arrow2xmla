@@ -1,14 +1,16 @@
-//! A float as its shortest round-trip text in Python's `repr` style (`1e-05`, `1e+16`, `2.0`, `nan`, `inf`): the text
+//! A float as its shortest round-trip text in Python's `repr` style (`1e-05`, `1e+16`, `2.0`; and `NaN`, `INF`, `-INF`,
+//! the lexical forms of xsd:double): the text
 //! clients of an existing XMLA server already get, so a switch to this crate changes no byte. The digits come from
 //! `zmij` (shortest, nearest, ties to even); the common range needs no change, the rest is laid out here.
 
 pub fn write_f64(out: &mut Vec<u8>, v: f64) {
+    // the lexical forms of xsd:double (Python's `nan` and `inf` are not)
     if v.is_nan() {
-        out.extend_from_slice(b"nan");
+        out.extend_from_slice(b"NaN");
         return;
     }
     if v.is_infinite() {
-        out.extend_from_slice(if v < 0.0 { b"-inf" } else { b"inf" });
+        out.extend_from_slice(if v < 0.0 { b"-INF" } else { b"INF" });
         return;
     }
     let mut buf = zmij::Buffer::new();
@@ -116,11 +118,41 @@ mod tests {
             (0.1 + 0.2, "0.30000000000000004"),
             (686036261402521.25, "686036261402521.2"),
             (686036261402521.75, "686036261402521.8"),
-            (f64::NAN, "nan"),
-            (f64::INFINITY, "inf"),
-            (f64::NEG_INFINITY, "-inf"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "INF"),
+            (f64::NEG_INFINITY, "-INF"),
         ] {
             assert_eq!(r(v), want, "{v:?}");
         }
+    }
+}
+
+/// A half-precision float (its bits) as a double: exact.
+pub fn f16_to_f64(bits: u16) -> f64 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = i32::from((bits >> 10) & 0x1F);
+    let frac = f64::from(bits & 0x03FF);
+    match exp {
+        0 => sign * frac * 2f64.powi(-24),
+        31 if frac == 0.0 => sign * f64::INFINITY,
+        31 => f64::NAN,
+        _ => sign * (1.0 + frac / 1024.0) * 2f64.powi(exp - 15),
+    }
+}
+
+#[cfg(test)]
+mod f16_tests {
+    use super::f16_to_f64;
+
+    #[test]
+    fn half_floats_widen_exactly() {
+        assert_eq!(f16_to_f64(0x3C00), 1.0);
+        assert_eq!(f16_to_f64(0xC000), -2.0);
+        assert_eq!(f16_to_f64(0x7BFF), 65504.0);
+        assert_eq!(f16_to_f64(0x0001), 2f64.powi(-24)); // the smallest subnormal
+        assert_eq!(f16_to_f64(0x0400), 2f64.powi(-14)); // the smallest normal
+        assert_eq!(f16_to_f64(0x7C00), f64::INFINITY);
+        assert!(f16_to_f64(0x7E00).is_nan());
+        assert!(f16_to_f64(0x8000).is_sign_negative() && f16_to_f64(0x8000) == 0.0);
     }
 }

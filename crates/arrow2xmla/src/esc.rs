@@ -1,6 +1,8 @@
-//! XML escaping, byte-for-byte what Python's `xml.sax.saxutils` does (the reference the tests compare against).
+//! XML escaping: what Python's `xml.sax.saxutils` does (`&`, `<`, `>`, and `quoteattr` for attributes), plus one
+//! deliberate difference: a character XML 1.0 forbids becomes U+FFFD, so the answer is always well-formed.
 
-/// `saxutils.escape` (`&`, `<`, `>`), and a character XML 1.0 forbids becomes U+FFFD.
+/// `saxutils.escape` (`&`, `<`, `>`), a carriage return as a reference (a parser would read a raw one as a line
+/// feed), and a character XML 1.0 forbids becomes U+FFFD.
 pub fn escape_into(out: &mut Vec<u8>, s: &str) {
     escape_bytes_into(out, s.as_bytes());
 }
@@ -20,11 +22,25 @@ fn forbidden(rest: &[u8]) -> usize {
     }
 }
 
-/// True when `bytes` may hold a character `escape_bytes_into` changes: `&`, `<`, `>`, or one XML forbids. May say
+/// True when `bytes` hold a character XML 1.0 forbids (a control character other than tab, line feed and carriage
+/// return, or U+FFFE / U+FFFF).
+#[cfg(feature = "request")]
+pub fn has_forbidden(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i < bytes.len() {
+        if forbidden(&bytes[i..]) > 0 {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True when `bytes` may hold a character `escape_bytes_into` changes: `&`, `<`, `>`, `\r`, or one XML forbids. May say
 /// yes for a text that needs nothing (0xEF starts many characters); never says no when something is to change.
 #[inline]
 pub fn needs_escape(bytes: &[u8]) -> bool {
-    bytes.iter().any(|&b| matches!(b, b'&' | b'<' | b'>' | 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0xEF))
+    bytes.iter().any(|&b| matches!(b, b'&' | b'<' | b'>' | b'\r' | 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0xEF))
 }
 
 /// `escape` on UTF-8 bytes (the bytes of an Arrow string): a run with nothing to change is copied whole.
@@ -36,6 +52,7 @@ pub fn escape_bytes_into(out: &mut Vec<u8>, bytes: &[u8]) {
             b'&' => (b"&amp;", 1),
             b'<' => (b"&lt;", 1),
             b'>' => (b"&gt;", 1),
+            b'\r' => (b"&#13;", 1), // a raw carriage return would be read back as a line feed
             _ => match forbidden(&bytes[i..]) {
                 0 => {
                     i += 1;
@@ -110,7 +127,7 @@ mod tests {
     fn forbidden_characters_become_the_replacement_character() {
         assert_eq!(e("a\u{0}b\u{1F}c\u{B}"), "a\u{FFFD}b\u{FFFD}c\u{FFFD}");
         assert_eq!(e("x\u{FFFE}y\u{FFFF}"), "x\u{FFFD}y\u{FFFD}");
-        assert_eq!(e("tab\tnl\ncr\r"), "tab\tnl\ncr\r"); // legal
+        assert_eq!(e("tab\tnl\ncr\r"), "tab\tnl\ncr&#13;"); // tab and line feed are kept; a carriage return survives a parse
         assert_eq!(e("\u{FFFD}\u{FF01}\u{F000}"), "\u{FFFD}\u{FF01}\u{F000}"); // legal, and share a lead byte
     }
 

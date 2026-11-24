@@ -10,30 +10,70 @@ use std::sync::Mutex;
 use crate::array::{Array, Values};
 use crate::display::{children_bits, display_infos, DRILLED_DOWN};
 use crate::esc::{escape_attr_into, escape_bytes_into, escape_into, needs_escape, quote_attr_into};
-use crate::float::write_f64;
+use crate::float::{f16_to_f64, write_f64};
 use crate::model::{Axis, AxisSource, Cellset, Member, MemberProp};
 use crate::{Error, XA};
 
 const FLUSH_AT: usize = 1 << 20; // bytes of small parts held before they go out as a chunk
-const PAR_MIN_ROWS: usize = 16 * 1024; // below this a single thread is faster than the hand-over
+const PAR_MIN_WORK: usize = 16 * 1024; // cells (or members) below which a single thread is faster than the hand-over
+const MAX_THREADS: usize = 64; // what a caller may ask for
 const LEVEL_CHUNK_ROWS: usize = 2048; // rows of a level axis per chunk: about 1 MB
 const CELL_CHUNK_CELLS: usize = 12 * 1024; // cells per chunk: about 1 MB
 const SAME_PARENT_TEXT: &[u8] = b"131072"; // SAME_PARENT
 
 /// How a cellset is written.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct WriteOptions {
     /// Threads that render at once; 0 picks the machine's (at most 8). 1 keeps everything on the calling thread.
     pub threads: usize,
 }
 
 impl WriteOptions {
+    /// Options with `threads` set (0: the machine's; at most 64 are used).
+    pub fn with_threads(threads: usize) -> Self {
+        Self { threads }
+    }
+
     fn threads(self) -> usize {
         if self.threads > 0 {
-            self.threads
+            self.threads.min(MAX_THREADS)
         } else {
-            std::thread::available_parallelism().map_or(1, |n| n.get()).min(8)
+            machine_threads().min(8)
         }
+    }
+}
+
+fn machine_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
+/// Worker threads in use by all the writers of the process: the sum stays within the machine's cores, so many
+/// answers written at once share them instead of each starting its own set.
+static IN_USE: AtomicUsize = AtomicUsize::new(0);
+
+struct Lease(usize);
+
+impl Lease {
+    /// Up to `want` threads of what is left (possibly none).
+    fn take(want: usize) -> Lease {
+        let cap = machine_threads().max(2);
+        loop {
+            let used = IN_USE.load(Ordering::Relaxed);
+            let got = want.min(cap.saturating_sub(used));
+            if got == 0 {
+                return Lease(0);
+            }
+            if IN_USE.compare_exchange(used, used + got, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                return Lease(got);
+            }
+        }
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        IN_USE.fetch_sub(self.0, Ordering::Relaxed);
     }
 }
 
@@ -65,16 +105,20 @@ impl Writer<'_> {
     }
 
     /// Renders rows `0..n` in chunks of `rows_per_chunk` (a chunk is `f(range, buf)`), on several threads when there
-    /// are enough rows, and passes the chunks on in row order.
-    fn parallel<F>(&mut self, n: usize, rows_per_chunk: usize, bytes_per_row: usize, f: F) -> Result<(), Error>
+    /// is enough work (`n * weight`), and passes the chunks on in row order. The calling thread renders too; threads
+    /// that cannot be started (or are not free: see `Lease`) only mean fewer of them.
+    fn parallel<F>(&mut self, n: usize, weight: usize, rows_per_chunk: usize, bytes_per_row: usize, f: F) -> Result<(), Error>
     where
         F: Fn(Range<usize>, &mut Vec<u8>) + Sync,
     {
         self.flush()?;
         let chunks = n.div_ceil(rows_per_chunk);
         let range = |c: usize| c * rows_per_chunk..((c + 1) * rows_per_chunk).min(n);
-        let threads = self.threads.min(chunks);
-        if threads <= 1 || n < PAR_MIN_ROWS {
+        let want = if n.saturating_mul(weight) < PAR_MIN_WORK { 1 } else { self.threads.min(chunks) };
+        let lease = if want > 1 { Lease::take(want) } else { Lease(0) };
+        let threads = lease.0;
+        if threads <= 1 {
+            drop(lease);
             for c in 0..chunks {
                 let mut buf = Vec::with_capacity(rows_per_chunk * bytes_per_row);
                 f(range(c), &mut buf);
@@ -88,18 +132,21 @@ impl Writer<'_> {
             let last = (first + wave).min(chunks);
             let next = AtomicUsize::new(first);
             let done: Vec<Mutex<Option<Vec<u8>>>> = (first..last).map(|_| Mutex::new(None)).collect();
-            std::thread::scope(|s| {
-                for _ in 0..threads {
-                    s.spawn(|| loop {
-                        let c = next.fetch_add(1, Ordering::Relaxed);
-                        if c >= last {
-                            break;
-                        }
-                        let mut buf = Vec::with_capacity(rows_per_chunk * bytes_per_row);
-                        f(range(c), &mut buf);
-                        *done[c - first].lock().expect("a worker panicked") = Some(buf);
-                    });
+            let work = || loop {
+                let c = next.fetch_add(1, Ordering::Relaxed);
+                if c >= last {
+                    break;
                 }
+                let mut buf = Vec::with_capacity(rows_per_chunk * bytes_per_row);
+                f(range(c), &mut buf);
+                *done[c - first].lock().expect("a worker panicked") = Some(buf);
+            };
+            std::thread::scope(|s| {
+                for _ in 1..threads {
+                    // a thread that cannot start is not an error: the others take its chunks
+                    let _ = std::thread::Builder::new().spawn_scoped(s, work);
+                }
+                work();
             });
             for slot in done {
                 (self.sink)(slot.into_inner().expect("a worker panicked").expect("every chunk is rendered"))?;
@@ -269,7 +316,7 @@ fn level_pieces(m: &Member, props: &[MemberProp]) -> (Vec<Piece>, Vec<Piece>) {
 fn classify(t: &[u8]) -> (bool, bool) {
     let (mut special, mut bracket) = (false, false);
     for &b in t {
-        special |= matches!(b, b'&' | b'<' | b'>' | 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0xEF);
+        special |= matches!(b, b'&' | b'<' | b'>' | b'\r' | 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0xEF);
         bracket |= b == b']';
     }
     (special, bracket)
@@ -313,7 +360,7 @@ fn write_axis(w: &mut Writer<'_>, n: usize, axis: &Axis<'_>) -> Result<(), Error
             let mut blank = Vec::new();
             escape_into(&mut blank, &l.blank_caption);
             let keys = l.keys;
-            w.parallel(keys.len(), LEVEL_CHUNK_ROWS, 450, |range, out| {
+            w.parallel(keys.len(), 1, LEVEL_CHUNK_ROWS, 450, |range, out| {
                 let (mut key, mut cap) = (Vec::new(), Vec::new());
                 for i in range {
                     let (key_b, cap_b): (&[u8], &[u8]) = match keys.text(i) {
@@ -387,9 +434,21 @@ fn close_cell(b: &mut Vec<u8>, tail: &[u8]) {
     b.extend_from_slice(b"</Cell>");
 }
 
+/// The XSD type of an integer: `xsd:int` is 32 bits, so a larger value is a `long` (or `unsignedLong`).
+#[inline]
+fn int_type(v: i128) -> &'static [u8] {
+    if (i128::from(i32::MIN)..=i128::from(i32::MAX)).contains(&v) {
+        b"xsd:int"
+    } else if (i128::from(i64::MIN)..=i128::from(i64::MAX)).contains(&v) {
+        b"xsd:long"
+    } else {
+        b"xsd:unsignedLong"
+    }
+}
+
 macro_rules! int_cell {
     ($vals:expr, $r:expr, $b:expr, $ord:expr, $tail:expr) => {{
-        open_cell($b, $ord, b"xsd:int");
+        open_cell($b, $ord, int_type($vals[$r] as i128));
         $b.extend_from_slice(itoa::Buffer::new().format($vals[$r]).as_bytes());
         close_cell($b, $tail);
     }};
@@ -417,6 +476,11 @@ fn write_cell(b: &mut Vec<u8>, ord: u64, col: &Col<'_>, r: usize, with_value: bo
         Values::F64(v) => {
             open_cell(b, ord, b"xsd:double");
             write_f64(b, v[r]);
+            close_cell(b, tail);
+        }
+        Values::F16(v) => {
+            open_cell(b, ord, b"xsd:double");
+            write_f64(b, f16_to_f64(v[r]));
             close_cell(b, tail);
         }
         Values::F32(v) => {
@@ -453,14 +517,10 @@ fn write_cells(w: &mut Writer<'_>, cs: &Cellset<'_>) -> Result<(), Error> {
         return Ok(());
     }
     let rows = cs.columns[0].values.len();
-    if cs.columns.iter().any(|c| c.values.len() != rows) {
-        return Err(Error::Invalid("the columns are not of one length".into()));
-    }
     let cols: Vec<Col<'_>> = cs
         .columns
         .iter()
         .map(|c| {
-            c.values.check()?;
             let mut tail = Vec::new();
             for p in &cs.cell_properties {
                 let value = match p.name.as_str() {
@@ -480,7 +540,7 @@ fn write_cells(w: &mut Writer<'_>, cs: &Cellset<'_>) -> Result<(), Error> {
         })
         .collect::<Result<_, Error>>()?;
     let rows_per_chunk = (CELL_CHUNK_CELLS / ncols).max(256);
-    w.parallel(rows, rows_per_chunk, ncols * 90, |range, out| {
+    w.parallel(rows, ncols, rows_per_chunk, ncols * 90, |range, out| {
         for r in range {
             for (c, col) in cols.iter().enumerate() {
                 write_cell(out, (r * ncols + c) as u64, col, r, with_value);
@@ -489,17 +549,65 @@ fn write_cells(w: &mut Writer<'_>, cs: &Cellset<'_>) -> Result<(), Error> {
     })
 }
 
+/// The members an axis lists (a level axis: its All member, then its values).
+fn axis_len(axis: &Axis<'_>) -> usize {
+    match &axis.source {
+        AxisSource::Tuples(t) => t.tuples.len(),
+        AxisSource::Level(l) => l.keys.len() + usize::from(l.all.is_some()),
+    }
+}
+
 impl Cellset<'_> {
-    /// Writes the cellset as a series of chunks of about 1 MB, each handed to `sink` in order.
-    pub fn write_chunks(&self, opts: WriteOptions, sink: &mut dyn FnMut(Vec<u8>) -> Result<(), Error>) -> Result<(), Error> {
+    /// Everything that can be wrong with the input, before the first byte is written (a caller that streams the
+    /// answer must not have sent half of it when an error comes back).
+    pub fn validate(&self) -> Result<(), Error> {
         for axis in &self.axes {
-            if let AxisSource::Level(l) = &axis.source {
-                l.keys.check()?;
-                if !l.keys.is_text() {
-                    return Err(Error::Unsupported("a level's keys must be a text array".into()));
+            match &axis.source {
+                AxisSource::Level(l) => {
+                    l.keys.check()?;
+                    if !l.keys.is_text() {
+                        return Err(Error::Unsupported("a level's keys must be a text array".into()));
+                    }
+                }
+                AxisSource::Tuples(t) => {
+                    let width = t.tuples.first().map_or(0, Vec::len);
+                    if t.tuples.iter().any(|x| x.len() != width || x.iter().any(|&k| k as usize >= t.members.len())) {
+                        return Err(Error::Invalid("tuples of different widths, or a member index out of range".into()));
+                    }
                 }
             }
         }
+        let ncols = self.columns.len();
+        if ncols == 0 {
+            return Ok(());
+        }
+        let rows = self.columns[0].values.len();
+        for c in &self.columns {
+            if c.values.len() != rows {
+                return Err(Error::Invalid("the columns are not of one length".into()));
+            }
+            c.values.check()?;
+        }
+        // a cell's ordinal is `row * columns + column`: the axes must list exactly those cells
+        let lens: Vec<usize> = self.axes.iter().map(axis_len).collect();
+        let ok = match lens.as_slice() {
+            [] => rows == 0,
+            [n] => *n == rows * ncols,
+            [cols, rws] => *cols == ncols && *rws == rows,
+            more => more.iter().product::<usize>() == rows * ncols,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::Invalid(format!(
+                "the axes list {lens:?} members but there are {rows} rows of {ncols} columns of cells (one axis: rows * columns; two: columns, then rows)"
+            )))
+        }
+    }
+
+    /// Writes the cellset as a series of chunks of about 1 MB, each handed to `sink` in order.
+    pub fn write_chunks(&self, opts: WriteOptions, sink: &mut dyn FnMut(Vec<u8>) -> Result<(), Error>) -> Result<(), Error> {
+        self.validate()?;
         let mut w = Writer { pending: Vec::with_capacity(FLUSH_AT + (FLUSH_AT >> 2)), sink, threads: opts.threads() };
         let b = &mut w.pending;
         lit(

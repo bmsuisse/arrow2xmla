@@ -24,6 +24,7 @@ pub use request::{parse_request, Call, ParseError, Request, Session};
 pub const XA: &str = "urn:schemas-microsoft-com:xml-analysis";
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     Io(std::io::Error),
     /// A column or array type that is not written.
@@ -158,5 +159,72 @@ mod tests {
         let a = Array::new(Values::Utf8View { views: &views, buffers: &bufs });
         assert_eq!(a.text(0), Some(&b"abc"[..]));
         assert_eq!(a.text(1), Some(&long[..]));
+    }
+
+    #[test]
+    fn the_axes_must_list_the_cells() {
+        let (offsets, data) = text(&["a", "b"]);
+        let mut cs = cellset(&offsets, &data, &[1.0, 2.0, 3.0]);
+        assert!(cs.to_vec().is_err(), "three cells but two members");
+        cs.columns[0].values = Array::new(Values::F64(&[1.0, 2.0]));
+        assert!(cs.to_vec().is_ok());
+        cs.columns.push(Column { values: Array::new(Values::F64(&[3.0, 4.0])), format: "0".into() });
+        assert!(cs.to_vec().is_err(), "two columns need a columns axis");
+    }
+
+    #[test]
+    fn integers_are_typed_by_their_size() {
+        let (offsets, data) = text(&["a", "b", "c"]);
+        let mut cs = cellset(&offsets, &data, &[0.0; 3]);
+        let big = [5i64, i64::from(i32::MAX) + 1, i64::MIN];
+        cs.columns[0].values = Array::new(Values::I64(&big));
+        let xml = String::from_utf8(cs.to_vec().unwrap()).unwrap();
+        assert!(xml.contains("xsd:int\">5<"));
+        assert!(xml.contains("xsd:long\">2147483648<"));
+        assert!(xml.contains("xsd:long\">-9223372036854775808<"));
+        let huge = [u64::MAX, 1, 2];
+        cs.columns[0].values = Array::new(Values::U64(&huge));
+        assert!(String::from_utf8(cs.to_vec().unwrap()).unwrap().contains("xsd:unsignedLong\">18446744073709551615<"));
+    }
+
+    #[test]
+    fn text_that_is_not_utf8_is_refused() {
+        let offsets = [0, 2];
+        let a = Array::new(Values::Utf8 { offsets: &offsets, data: &[0xFF, 0xFE] });
+        assert!(a.check().is_err());
+        let surrogate = [0xED, 0xA0, 0x80];
+        let a = Array::new(Values::Utf8 { offsets: &[0, 3], data: &surrogate });
+        assert!(a.check().is_err());
+        assert!(Array::new(Values::Utf8 { offsets: &[0, 2], data: "é".as_bytes() }).check().is_ok());
+    }
+
+    #[test]
+    fn a_string_view_outside_its_buffer_is_refused() {
+        let mut view = [0u8; 16];
+        view[..4].copy_from_slice(&50u32.to_le_bytes());
+        view[12..16].copy_from_slice(&1000u32.to_le_bytes());
+        let bufs: [&[u8]; 1] = [b"abc"];
+        let views = [view];
+        assert!(Array::new(Values::Utf8View { views: &views, buffers: &bufs }).check().is_err());
+        let a = Array::new(Values::Utf8View { views: &views, buffers: &bufs }).with_validity(&[0], 0); // a null: never read
+        assert!(a.check().is_ok());
+    }
+
+    #[test]
+    fn many_writers_at_once_agree() {
+        let names: Vec<String> = (0..30_000).map(|i| format!("k{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (offsets, data) = text(&refs);
+        let floats: Vec<f64> = (0..30_000).map(|i| f64::from(i) * 0.1).collect();
+        let cs = cellset(&offsets, &data, &floats);
+        let want = cs.to_vec().unwrap();
+        let cs = &cs;
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..12).map(|i| s.spawn(move || cs.write_chunks(WriteOptions::with_threads(i % 5), &mut |_| Ok(())))).collect();
+            for h in handles {
+                h.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(cs.to_vec().unwrap(), want);
     }
 }

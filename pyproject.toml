@@ -9,19 +9,25 @@ description = "Arrow in, XMLA out: a generic, engine-free XMLA cellset writer an
 requires-python = ">=3.10"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 keywords = ["xmla", "arrow", "excel", "olap", "mdx"]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
     "Topic :: Database",
 ]
-dependencies = ["pyarrow>=15"]
+dependencies = []  # none: Arrow arrays are read through the PyCapsule interface
+
+[project.optional-dependencies]
+pyarrow = ["pyarrow>=15"]  # for chunked arrays and Arrow streams; any other Arrow library works as well
 
 [project.urls]
+Homepage = "https://github.com/bmsuisse/arrow2xmla"
 Repository = "https://github.com/bmsuisse/arrow2xmla"
+Issues = "https://github.com/bmsuisse/arrow2xmla/issues"
 
 [dependency-groups]
-dev = ["maturin>=1.7", "pytest>=8", "pytest-benchmark>=4"]
+dev = ["maturin>=1.7", "pytest>=8", "pytest-benchmark>=4", "pyarrow>=15"]
 
 [tool.maturin]
 manifest-path = "crates/arrow2xmla-py/Cargo.toml"

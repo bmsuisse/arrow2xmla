@@ -1,17 +1,24 @@
 //! Parsing of an XMLA request (a SOAP envelope holding a `Discover` or an `Execute`). No DOCTYPE is ever accepted (no
-//! entity expansion), and the nesting is bounded. UTF-8 only.
+//! entity expansion), the nesting and the number of elements are bounded, and what a strict parser refuses is refused
+//! (a second root, text outside the root, an undeclared prefix, characters XML forbids). UTF-8 and UTF-16 with a BOM.
+//! The size of a body is for the caller to limit.
 
 use quick_xml::events::Event;
 use quick_xml::XmlVersion;
 use quick_xml::name::ResolveResult;
 use quick_xml::NsReader;
 
+use crate::esc::has_forbidden;
 use crate::XA;
 
 const SOAP: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 const MAX_DEPTH: usize = 64;
+/// Elements one request may have: a request is a few dozen, a statement with its filters a few thousand. The body's
+/// size is the caller's to limit; this keeps a body of nothing but tiny elements from costing many times its size.
+const MAX_ELEMENTS: usize = 100_000;
 
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParseError {
     Doctype,
     NotXml(String),
@@ -30,6 +37,7 @@ impl std::error::Error for ParseError {}
 
 /// What the SOAP header says about the session.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Session {
     /// No session header.
     None,
@@ -42,6 +50,7 @@ pub enum Session {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Call {
     Discover {
         request_type: String,
@@ -100,7 +109,8 @@ fn not_xml<E: std::fmt::Display>(e: E) -> ParseError {
 fn open(ns: &ResolveResult, e: &quick_xml::events::BytesStart) -> Result<El, ParseError> {
     let ns = match ns {
         ResolveResult::Bound(n) => n.as_ref().to_owned(),
-        _ => String::new(),
+        ResolveResult::Unbound => String::new(),
+        ResolveResult::Unknown(_) => return Err(ParseError::NotXml("a namespace prefix that is not declared".into())),
     };
     let mut el = El { ns, local: e.local_name().as_ref().to_owned(), ..El::default() };
     for a in e.attributes() {
@@ -109,30 +119,48 @@ fn open(ns: &ResolveResult, e: &quick_xml::events::BytesStart) -> Result<El, Par
         if key == "xmlns" || key.starts_with("xmlns:") {
             continue; // a namespace declaration is not an attribute
         }
+        if a.value.contains('<') {
+            return Err(ParseError::NotXml("`<` in an attribute value".into()));
+        }
         let v = a.normalized_value(XmlVersion::Implicit1_0).map_err(not_xml)?.into_owned();
-        el.attrs.push((a.key.local_name().as_ref().to_owned(), v));
+        if has_forbidden(v.as_bytes()) {
+            return Err(ParseError::NotXml("a character XML does not allow".into()));
+        }
+        if !key.contains(':') {
+            el.attrs.push((key.to_owned(), v)); // a prefixed attribute is another one than the plain name
+        }
     }
     Ok(el)
 }
 
-fn text_into(stack: &mut [El], s: &str) {
-    if let Some(top) = stack.last_mut() {
-        if !top.seen_child {
-            top.text.push_str(s); // like ElementTree's `.text`: only what comes before the first child
+fn text_into(stack: &mut [El], s: &str) -> Result<(), ParseError> {
+    if has_forbidden(s.as_bytes()) {
+        return Err(ParseError::NotXml("a character XML does not allow".into()));
+    }
+    match stack.last_mut() {
+        Some(top) => {
+            if !top.seen_child {
+                top.text.push_str(s); // like ElementTree's `.text`: only what comes before the first child
+            }
+            Ok(())
         }
+        None if s.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n')) => Ok(()),
+        None => Err(ParseError::NotXml("text outside the root element".into())),
     }
 }
 
-fn close(stack: &mut Vec<El>, root: &mut Option<El>) {
+fn close(stack: &mut Vec<El>, root: &mut Option<El>) -> Result<(), ParseError> {
     if let Some(el) = stack.pop() {
         match stack.last_mut() {
             Some(parent) => {
                 parent.seen_child = true;
                 parent.children.push(el);
             }
+            None if root.is_some() => return Err(ParseError::NotXml("more than one root element".into())),
             None => *root = Some(el),
         }
     }
+    Ok(())
 }
 
 /// UTF-8 (with or without a BOM) as is; UTF-16 with a BOM is turned into UTF-8 first. Anything else is refused.
@@ -160,23 +188,37 @@ fn dom(body: &[u8]) -> Result<El, ParseError> {
     let mut buf = Vec::new();
     let mut stack: Vec<El> = vec![];
     let mut root: Option<El> = None;
+    let mut elements = 0usize;
+    // a new element: counted, bounded, and never a second root
+    let begin = |stack: &Vec<El>, root: &Option<El>, elements: &mut usize| -> Result<(), ParseError> {
+        *elements += 1;
+        if *elements > MAX_ELEMENTS {
+            return Err(ParseError::NotXml("too many elements".into()));
+        }
+        if stack.len() >= MAX_DEPTH {
+            return Err(ParseError::NotXml("too deeply nested".into()));
+        }
+        if stack.is_empty() && root.is_some() {
+            return Err(ParseError::NotXml("more than one root element".into()));
+        }
+        Ok(())
+    };
     loop {
         let (ns, ev) = reader.read_resolved_event_into(&mut buf).map_err(not_xml)?;
         match ev {
             Event::DocType(_) => return Err(ParseError::Doctype),
             Event::Start(e) => {
-                if stack.len() >= MAX_DEPTH {
-                    return Err(ParseError::NotXml("too deeply nested".into()));
-                }
+                begin(&stack, &root, &mut elements)?;
                 stack.push(open(&ns, &e)?);
             }
             Event::Empty(e) => {
+                begin(&stack, &root, &mut elements)?;
                 stack.push(open(&ns, &e)?);
-                close(&mut stack, &mut root);
+                close(&mut stack, &mut root)?;
             }
-            Event::End(_) => close(&mut stack, &mut root),
-            Event::Text(t) => text_into(&mut stack, &t.xml10_content()),
-            Event::CData(c) => text_into(&mut stack, &c.xml10_content()),
+            Event::End(_) => close(&mut stack, &mut root)?,
+            Event::Text(t) => text_into(&mut stack, &t.xml10_content())?,
+            Event::CData(c) => text_into(&mut stack, &c.xml10_content())?,
             Event::GeneralRef(r) => {
                 let name = r.xml10_content();
                 let ch = if let Some(c) = r.resolve_char_ref().map_err(not_xml)? {
@@ -191,7 +233,7 @@ fn dom(body: &[u8]) -> Result<El, ParseError> {
                         other => return Err(ParseError::NotXml(format!("unknown entity &{other};"))),
                     }
                 };
-                text_into(&mut stack, &ch);
+                text_into(&mut stack, &ch)?;
             }
             Event::Eof => break,
             _ => {}
@@ -231,19 +273,20 @@ pub fn parse_request(body: &[u8]) -> Result<Request, ParseError> {
         None => Session::None,
         Some(h) if h.child(XA, "BeginSession").is_some() => Session::Begin,
         Some(h) => match (h.child(XA, "EndSession"), h.child(XA, "Session")) {
-            (Some(e), _) => Session::End(e.attr("SessionId").map(str::to_owned)),
-            (None, Some(s)) => s.attr("SessionId").map_or(Session::None, |id| Session::Use(id.to_owned())),
+            (Some(e), _) => Session::End(e.attr("SessionId").filter(|id| !id.is_empty()).map(str::to_owned)),
+            (None, Some(s)) => s.attr("SessionId").filter(|id| !id.is_empty()).map_or(Session::None, |id| Session::Use(id.to_owned())),
             (None, None) => Session::None,
         },
     };
-    let body_el = root.child(SOAP, "Body");
-    let call = if let Some(d) = body_el.and_then(|b| b.child(XA, "Discover")) {
+    // the first Discover (or Execute) of any Body, as a path lookup in ElementTree finds it
+    let bodies = || root.children.iter().filter(|c| c.ns == SOAP && c.local == "Body");
+    let call = if let Some(d) = bodies().find_map(|b| b.child(XA, "Discover")) {
         Call::Discover {
             request_type: d.child(XA, "RequestType").map(|r| r.text.trim().to_owned()).unwrap_or_default(),
             restrictions: list(Some(d), "Restrictions", "RestrictionList").unwrap_or_default(),
             properties: properties(d),
         }
-    } else if let Some(x) = body_el.and_then(|b| b.child(XA, "Execute")) {
+    } else if let Some(x) = bodies().find_map(|b| b.child(XA, "Execute")) {
         Call::Execute {
             statement: x.path(&[(XA, "Command"), (XA, "Statement")]).map(|s| s.text.clone()).unwrap_or_default(),
             properties: properties(x),

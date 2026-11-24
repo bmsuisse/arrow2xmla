@@ -20,6 +20,7 @@ pub struct Member {
 
 /// A member property a client may ask for (`DIMENSION PROPERTIES`), written after each member of its axis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MemberProp {
     ParentUniqueName,
     HierarchyUniqueName,

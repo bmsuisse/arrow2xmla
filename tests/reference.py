@@ -6,9 +6,21 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field, replace
 import re
 from typing import Any
-from xml.sax.saxutils import escape, quoteattr
+from xml.sax.saxutils import escape as _escape, quoteattr
 
 XA = "urn:schemas-microsoft-com:xml-analysis"
+
+
+def escape(text: str) -> str:
+    """`saxutils.escape`, and a carriage return as a reference (a parser reads a raw one back as a line feed)."""
+    return _escape(text, {"\r": "&#13;"})
+
+
+def attr_escape(text: str) -> str:
+    """Text for a double-quoted attribute value."""
+    return escape(text).replace('"', "&quot;").replace("\n", "&#10;").replace("\t", "&#9;")
+
+
 LANGUAGE = 1033
 
 CELL_PROPERTIES = {
@@ -75,7 +87,7 @@ def member_uname(hierarchy: str, key: object) -> str:
     return f"{hierarchy}.&[{str(key).replace(']', ']]')}]"
 
 
-_SPECIAL = re.compile("[&<>]").search
+_SPECIAL = re.compile("[&<>\r]").search
 
 
 def _esc(text: str) -> str:
@@ -84,11 +96,12 @@ def _esc(text: str) -> str:
 
 
 def _info(h: str, props: tuple[str, ...] = ()) -> str:
+    e = attr_escape(h)
     return (
-        f'<HierarchyInfo name="{escape(h)}"><UName name="{escape(h)}.[MEMBER_UNIQUE_NAME]" type="xsd:string"/>'
-        f'<Caption name="{escape(h)}.[MEMBER_CAPTION]" type="xsd:string"/><LName name="{escape(h)}.[LEVEL_UNIQUE_NAME]" type="xsd:string"/>'
-        f'<LNum name="{escape(h)}.[LEVEL_NUMBER]" type="xsd:int"/><DisplayInfo name="{escape(h)}.[DISPLAY_INFO]" type="xsd:unsignedInt"/>'
-        + "".join(f'<{p} name="{escape(h)}.[{p}]" type="xsd:string"/>' for p in props)
+        f'<HierarchyInfo name="{e}"><UName name="{e}.[MEMBER_UNIQUE_NAME]" type="xsd:string"/>'
+        f'<Caption name="{e}.[MEMBER_CAPTION]" type="xsd:string"/><LName name="{e}.[LEVEL_UNIQUE_NAME]" type="xsd:string"/>'
+        f'<LNum name="{e}.[LEVEL_NUMBER]" type="xsd:int"/><DisplayInfo name="{e}.[DISPLAY_INFO]" type="xsd:unsignedInt"/>'
+        + "".join(f'<{p} name="{e}.[{p}]" type="xsd:string"/>' for p in props)
         + "</HierarchyInfo>"
     )
 
@@ -253,11 +266,13 @@ def cellset_chunks(cs: Cellset) -> Iterator[str]:
             out.append(
                 f'<Cell CellOrdinal="{ordinal}"><Value xsi:type="xsd:string">{escape(str(value))}</Value>{tail(fmt)}</Cell>'
             )
-        elif isinstance(value, int):  # a count: an integer, as Analysis Services sends it
-            out.append(f'<Cell CellOrdinal="{ordinal}"><Value xsi:type="xsd:int">{value}</Value>{tail(fmt)}</Cell>')
+        elif isinstance(value, int):  # a count; xsd:int is 32 bits, so a larger value is a long
+            kind = "int" if -(2**31) <= value < 2**31 else "long" if -(2**63) <= value < 2**63 else "unsignedLong"
+            out.append(f'<Cell CellOrdinal="{ordinal}"><Value xsi:type="xsd:{kind}">{value}</Value>{tail(fmt)}</Cell>')
         else:
+            text = "NaN" if value != value else "INF" if value == float("inf") else "-INF" if value == float("-inf") else repr(value)
             out.append(
-                f'<Cell CellOrdinal="{ordinal}"><Value xsi:type="xsd:double">{value!r}</Value>{tail(fmt)}</Cell>'
+                f'<Cell CellOrdinal="{ordinal}"><Value xsi:type="xsd:double">{text}</Value>{tail(fmt)}</Cell>'
             )
         if len(out) >= _BATCH:
             yield "".join(out)

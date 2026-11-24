@@ -1,12 +1,15 @@
 //! Zero-copy views of columnar data: what the writer reads. A view is a few slices over memory the caller owns (Arrow
-//! buffers, a Rust `Vec`): nothing here depends on an Arrow library. `Array::from_c` reads the Arrow C data
+//! buffers, a Rust `Vec`): nothing here depends on an Arrow library. A binding builds them from the Arrow C data
 //! interface; with the `arrow` feature an `arrow_array::ArrayRef` converts too.
 
 use crate::Error;
 
 /// The values of a column, as the slices they are stored in (already shifted by the array's offset).
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub enum Values<'a> {
+    /// Half-precision floats as their bits.
+    F16(&'a [u16]),
     F64(&'a [f64]),
     F32(&'a [f32]),
     I64(&'a [i64]),
@@ -50,6 +53,7 @@ impl<'a> Array<'a> {
 
     pub fn len(&self) -> usize {
         match self.values {
+            Values::F16(v) => v.len(),
             Values::F64(v) => v.len(),
             Values::F32(v) => v.len(),
             Values::I64(v) => v.len(),
@@ -109,7 +113,9 @@ impl<'a> Array<'a> {
         }
     }
 
-    /// Checks what the writer relies on: offsets that stay inside the data and rise, views inside their buffers.
+    /// Checks what the writer relies on: offsets that stay inside the data and rise, views inside their buffers, text
+    /// that is valid UTF-8 (a string that is not would put bytes in the answer no XML parser accepts), a validity
+    /// bitmap long enough. The buffers themselves are trusted to be as long as they say.
     pub fn check(&self) -> Result<(), Error> {
         fn offsets_ok<T: Copy + Into<i64>>(offsets: &[T], data: usize) -> bool {
             let mut prev = 0i64;
@@ -122,12 +128,31 @@ impl<'a> Array<'a> {
         }
         let bad = |what: &str| Err(Error::Invalid(format!("a malformed array: {what}")));
         match self.values {
-            Values::Utf8 { offsets, data } if !offsets_ok(offsets, data.len()) => return bad("text offsets"),
-            Values::LargeUtf8 { offsets, data } if !offsets_ok(offsets, data.len()) => return bad("text offsets"),
+            Values::Utf8 { offsets, data } => {
+                if !offsets_ok(offsets, data.len()) {
+                    return bad("text offsets");
+                }
+                if std::str::from_utf8(data).is_err() {
+                    return bad("text that is not valid UTF-8");
+                }
+            }
+            Values::LargeUtf8 { offsets, data } => {
+                if !offsets_ok(offsets, data.len()) {
+                    return bad("text offsets");
+                }
+                if std::str::from_utf8(data).is_err() {
+                    return bad("text that is not valid UTF-8");
+                }
+            }
             Values::Utf8View { .. } => {
                 for i in 0..self.len() {
-                    // an out-of-range view reads as None; a view is only checked for its buffer index here
-                    let _ = self.text(i);
+                    if self.is_valid(i) {
+                        match self.text(i) {
+                            Some(t) if std::str::from_utf8(t).is_ok() => {}
+                            Some(_) => return bad("text that is not valid UTF-8"),
+                            None => return bad("a string view outside its buffer"),
+                        }
+                    }
                 }
             }
             _ => {}

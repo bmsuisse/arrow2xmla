@@ -38,8 +38,18 @@ req = parse_request(body)   # {"session": (kind, id), "call": {"kind": "execute"
 
 Explicit tuples can be given as member dicts, or (faster, 4-5x on big axes) as `{"members": [...], "tuples": [[0, 3], ...]}`.
 
-Columns may be any float or integer type, or text; nulls are cells with no value. Other types (bool, dates,
-decimals, dictionaries, ...) are refused with a `ValueError`; cast them first.
+Columns may be any float (16, 32, 64 bit), integer, or text type; nulls are cells with no value. Other types (bool, dates,
+decimals, dictionaries, ...) are refused with a `ValueError`; cast them first. A cell's ordinal is
+`row * len(columns) + column`, and the axes must list exactly those cells (two axes: the columns, then the rows; one
+axis: `rows * columns` members), else the call is refused before anything is written.
+
+Numbers are typed as XMLA expects: integers `xsd:int`, or `xsd:long` / `xsd:unsignedLong` when they do not fit 32 bits;
+floats `xsd:double` in Python's shortest `repr` form, with `NaN`, `INF`, `-INF`.
+
+Threads: `threads=0` uses the machine's cores (at most 8), but never more than are free: many answers written at once
+share them, so a web server does not oversubscribe. `threads=1` stays on the calling thread.
+
+Arrays are trusted (see `SECURITY.md`); request bodies are not.
 
 ## Develop
 
@@ -53,7 +63,8 @@ uv run python benchmarks/size.py             # size of the module and the wheel
 
 The parity tests hold the Rust output to the plain Python implementation in `tests/reference.py` and the request parser
 to Python's `expat` and `ElementTree`, on real Excel requests (`tests/fixtures/excel`). The reference passes characters XML
-forbids through; this crate replaces them (so Excel's parser accepts the answer): that is the one deliberate difference.
+forbids through; this crate replaces them with U+FFFD (so Excel's parser accepts the answer): that is the deliberate difference,
+and the tests keep those inputs out of the parity comparison.
 
 ## Speed and size
 

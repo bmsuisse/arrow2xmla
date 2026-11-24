@@ -49,7 +49,7 @@ fn bad(msg: impl Into<String>) -> PyErr {
     PyValueError::new_err(msg.into())
 }
 
-/// `n` elements of `T` at `ptr` (null is an empty slice when `n` is 0 and an error otherwise).
+/// `n` elements of `T` at `ptr` (an empty slice for 0; a null or misaligned pointer is an error otherwise).
 unsafe fn slice<'a, T>(ptr: *const c_void, n: usize, what: &str) -> PyResult<&'a [T]> {
     if n == 0 {
         return Ok(&[]);
@@ -60,40 +60,75 @@ unsafe fn slice<'a, T>(ptr: *const c_void, n: usize, what: &str) -> PyResult<&'a
     if !(ptr as usize).is_multiple_of(std::mem::align_of::<T>()) {
         return Err(bad(format!("an Arrow {what} buffer that is not aligned")));
     }
+    // a slice cannot hold more than isize::MAX bytes: a length like that is a producer's mistake
+    if n.checked_mul(std::mem::size_of::<T>()).is_none_or(|bytes| bytes > isize::MAX as usize) {
+        return Err(bad(format!("an Arrow array too long for its {what} buffer")));
+    }
     Ok(std::slice::from_raw_parts(ptr.cast::<T>(), n))
 }
 
+/// A count from the C structs (an `i64`) as a size: never negative.
+fn count(v: i64, what: &str) -> PyResult<usize> {
+    usize::try_from(v).map_err(|_| bad(format!("an Arrow array with a negative {what}")))
+}
+
 fn import<'a>(obj: &Bound<'_, PyAny>, keep: &mut Keep) -> PyResult<Array<'a>> {
-    let method = obj
-        .getattr("__arrow_c_array__")
-        .map_err(|_| bad("expected an Arrow array (an object with __arrow_c_array__); combine a chunked array first"))?;
+    let method = obj.getattr("__arrow_c_array__").map_err(|_| {
+        bad(format!(
+            "expected an Arrow array (an object with __arrow_c_array__, such as a pyarrow Array), not {}",
+            obj.get_type().name().map_or_else(|_| "this".to_string(), |n| format!("a {n}"))
+        ))
+    })?;
     let (schema_c, array_c): (Bound<'_, PyCapsule>, Bound<'_, PyCapsule>) = method.call0()?.extract()?;
     let schema = schema_c.pointer_checked(Some(c"arrow_schema"))?.as_ptr().cast::<ArrowSchema>();
     let array = array_c.pointer_checked(Some(c"arrow_array"))?.as_ptr().cast::<ArrowArray>();
     keep.capsules.push(schema_c.into_any().unbind());
     keep.capsules.push(array_c.into_any().unbind());
-    // SAFETY: the capsules hold valid C data interface structs (the protocol's contract) and stay alive in `keep`.
+    // SAFETY: the capsules hold C data interface structs (the protocol's contract) and stay alive in `keep`. What a
+    // producer got wrong that can be seen in the structs is refused below; the buffers are trusted to be as long as
+    // their array says (the interface has no way to say more).
     let (schema, array) = unsafe { (&*schema, &*array) };
+    if schema.release.is_none() || array.release.is_none() {
+        return Err(bad("an Arrow array that was already released"));
+    }
+    if schema.format.is_null() {
+        return Err(bad("an Arrow schema without a format"));
+    }
     if !array.dictionary.is_null() || array.n_children != 0 {
         return Err(bad("a dictionary or nested array: cast it to its plain type first"));
     }
+    if array.null_count < -1 {
+        return Err(bad("an Arrow array with an invalid null count"));
+    }
     let format = unsafe { CStr::from_ptr(schema.format) }.to_str().map_err(|_| bad("an Arrow format that is not text"))?;
-    let (len, off) = (array.length as usize, array.offset as usize);
-    let nb = array.n_buffers as usize;
+    let len = count(array.length, "length")?;
+    let off = count(array.offset, "offset")?;
+    let end = off.checked_add(len).ok_or_else(|| bad("an Arrow array too long"))?;
+    let nb = count(array.n_buffers, "buffer count")?;
+    let need = match format {
+        "g" | "f" | "e" | "l" | "i" | "s" | "c" | "L" | "I" | "S" | "C" => 2,
+        "u" | "U" => 3,
+        "vu" => 3,
+        other => return Err(bad(format!("an Arrow array of format {other:?} is not supported (floats, integers, text): cast it first"))),
+    };
+    if nb < need {
+        return Err(bad("an Arrow array with too few buffers"));
+    }
+    if array.buffers.is_null() {
+        return Err(bad("an Arrow array without its buffers"));
+    }
     let buffers = unsafe { std::slice::from_raw_parts(array.buffers, nb) };
-    // SAFETY (all the slices below): lengths come from the array and the buffers are those it declares
+    // SAFETY (all the slices below): lengths come from the checked counts and the buffers are those the array declares
     unsafe {
         macro_rules! prim {
-            ($t:ty, $v:ident) => {{
-                if nb < 2 {
-                    return Err(bad("an Arrow array with too few buffers"));
-                }
-                Values::$v(slice::<$t>(buffers[1], off + len, "data")?.get(off..).unwrap_or(&[]))
-            }};
+            ($t:ty, $v:ident) => {
+                Values::$v(&slice::<$t>(buffers[1], end, "data")?[off.min(end)..])
+            };
         }
         let values = match format {
             "g" => prim!(f64, F64),
             "f" => prim!(f32, F32),
+            "e" => prim!(u16, F16),
             "l" => prim!(i64, I64),
             "i" => prim!(i32, I32),
             "s" => prim!(i16, I16),
@@ -102,42 +137,39 @@ fn import<'a>(obj: &Bound<'_, PyAny>, keep: &mut Keep) -> PyResult<Array<'a>> {
             "I" => prim!(u32, U32),
             "S" => prim!(u16, U16),
             "C" => prim!(u8, U8),
-            "u" | "U" => {
-                if nb < 3 {
-                    return Err(bad("an Arrow text array with too few buffers"));
-                }
+            "u" | "U" if len == 0 => {
                 if format == "u" {
-                    let offsets = slice::<i32>(buffers[1], off + len + 1, "offsets")?;
-                    let offsets = &offsets[off..];
-                    let end = offsets.last().copied().unwrap_or(0).max(0) as usize;
-                    Values::Utf8 { offsets, data: slice::<u8>(buffers[2], end, "text")? }
+                    Values::Utf8 { offsets: &[0], data: &[] }
                 } else {
-                    let offsets = slice::<i64>(buffers[1], off + len + 1, "offsets")?;
-                    let offsets = &offsets[off..];
-                    let end = offsets.last().copied().unwrap_or(0).max(0) as usize;
-                    Values::LargeUtf8 { offsets, data: slice::<u8>(buffers[2], end, "text")? }
+                    Values::LargeUtf8 { offsets: &[0], data: &[] }
                 }
             }
-            "vu" => {
-                if nb < 3 {
-                    return Err(bad("an Arrow string-view array with too few buffers"));
-                }
-                let views = slice::<[u8; 16]>(buffers[1], off + len, "views")?;
+            "u" => {
+                let offsets = &slice::<i32>(buffers[1], end + 1, "offsets")?[off..];
+                let last = offsets.last().copied().unwrap_or(0).max(0) as usize;
+                Values::Utf8 { offsets, data: slice::<u8>(buffers[2], last, "text")? }
+            }
+            "U" => {
+                let offsets = &slice::<i64>(buffers[1], end + 1, "offsets")?[off..];
+                let last = usize::try_from(offsets.last().copied().unwrap_or(0).max(0)).map_err(|_| bad("an Arrow array too long"))?;
+                Values::LargeUtf8 { offsets, data: slice::<u8>(buffers[2], last, "text")? }
+            }
+            _ => {
+                // "vu": views, then the data buffers, then their sizes
+                let views = slice::<[u8; 16]>(buffers[1], end, "views")?;
                 let sizes = slice::<i64>(buffers[nb - 1], nb - 3, "sizes")?;
-                let data: Vec<&'static [u8]> = (0..nb - 3)
-                    .map(|i| slice::<u8>(buffers[2 + i], sizes[i].max(0) as usize, "text"))
-                    .collect::<PyResult<_>>()?;
+                let data = (0..nb - 3)
+                    .map(|i| slice::<u8>(buffers[2 + i], usize::try_from(sizes[i]).unwrap_or(0), "text"))
+                    .collect::<PyResult<Vec<&'static [u8]>>>()?;
                 keep.buffer_lists.push(data.into_boxed_slice());
                 let list: &[&[u8]] = keep.buffer_lists.last().expect("just pushed");
                 // SAFETY: the box is never dropped before `keep` is, and `keep` outlives every view.
-                Values::Utf8View { views: &views[off..], buffers: std::mem::transmute::<&[&[u8]], &'static [&'static [u8]]>(list) }
+                Values::Utf8View { views: &views[off.min(end)..], buffers: std::mem::transmute::<&[&[u8]], &'static [&'static [u8]]>(list) }
             }
-            other => return Err(bad(format!("an Arrow array of format {other:?} is not supported (floats, integers, text)"))),
         };
         let mut out = Array::new(values);
         if array.null_count != 0 && !buffers[0].is_null() {
-            let bytes = (off + len).div_ceil(8);
-            out = out.with_validity(slice::<u8>(buffers[0], bytes, "validity")?, off);
+            out = out.with_validity(slice::<u8>(buffers[0], end.div_ceil(8), "validity")?, off);
         }
         Ok(out)
     }
@@ -147,14 +179,28 @@ fn get<'py>(d: &Bound<'py, PyDict>, k: &str) -> PyResult<Bound<'py, PyAny>> {
     d.get_item(k)?.ok_or_else(|| PyKeyError::new_err(k.to_string()))
 }
 
+const MEMBER_KEYS: [&str; 8] = [
+    "hierarchy", "unique_name", "caption", "level_name", "level_number", "parent_unique_name", "children_cardinality", "member_type",
+];
+
 fn member(d: &Bound<'_, PyDict>) -> PyResult<Member> {
+    for k in d.keys().iter() {
+        let k: String = k.extract()?;
+        if !MEMBER_KEYS.contains(&k.as_str()) {
+            return Err(PyValueError::new_err(format!("a member has no key {k:?} (keys: {})", MEMBER_KEYS.join(", "))));
+        }
+    }
+    let level_number: i32 = get(d, "level_number")?.extract()?;
+    if level_number < 0 {
+        return Err(PyValueError::new_err("level_number must not be negative"));
+    }
     let opt = |k: &str| -> PyResult<Option<Bound<'_, PyAny>>> { d.get_item(k) };
     Ok(Member {
         hierarchy: get(d, "hierarchy")?.extract()?,
         unique_name: opt("unique_name")?.map_or(Ok(String::new()), |v| v.extract())?,
         caption: opt("caption")?.map_or(Ok(String::new()), |v| v.extract())?,
         level_name: get(d, "level_name")?.extract()?,
-        level_number: get(d, "level_number")?.extract()?,
+        level_number,
         parent_unique_name: opt("parent_unique_name")?.map_or(Ok(String::new()), |v| v.extract())?,
         children_cardinality: opt("children_cardinality")?.map_or(Ok(0), |v| v.extract())?,
         member_type: opt("member_type")?.map_or(Ok(1), |v| v.extract())?,
@@ -163,7 +209,13 @@ fn member(d: &Bound<'_, PyDict>) -> PyResult<Member> {
 
 fn props(d: &Bound<'_, PyDict>) -> PyResult<Vec<MemberProp>> {
     let Some(l) = d.get_item("properties")? else { return Ok(vec![]) };
-    l.extract::<Vec<String>>()?
+    let names = l.extract::<Vec<String>>()?;
+    for (i, n) in names.iter().enumerate() {
+        if names[..i].contains(n) {
+            return Err(PyValueError::new_err(format!("member property {n} twice")));
+        }
+    }
+    names
         .iter()
         .map(|n| MemberProp::from_name(n).ok_or_else(|| PyValueError::new_err(format!("unknown member property {n}"))))
         .collect()
@@ -201,11 +253,19 @@ fn axis<'a>(d: &Bound<'_, PyDict>, keep: &mut Keep) -> PyResult<Axis<'a>> {
 fn build<'a>(spec: &Bound<'_, PyDict>, keep: &mut Keep) -> PyResult<Cellset<'a>> {
     let mut cs = Cellset::new(get(spec, "cube")?.extract::<String>()?);
     if let Some(l) = spec.get_item("language")? {
+        if l.is_instance_of::<pyo3::types::PyBool>() {
+            return Err(PyValueError::new_err("language is a number (an LCID), not a bool"));
+        }
         cs.language = l.extract()?;
     }
     if let Some(p) = spec.get_item("cell_properties")? {
-        cs.cell_properties = p
-            .extract::<Vec<String>>()?
+        let names = p.extract::<Vec<String>>()?;
+        for (i, n) in names.iter().enumerate() {
+            if names[..i].contains(n) {
+                return Err(PyValueError::new_err(format!("cell property {n} twice")));
+            }
+        }
+        cs.cell_properties = names
             .iter()
             .map(|n| CellProperty::standard(n).ok_or_else(|| PyValueError::new_err(format!("unknown cell property {n}"))))
             .collect::<PyResult<_>>()?;
@@ -233,7 +293,7 @@ fn chunks_of(py: Python<'_>, spec: &Bound<'_, PyDict>, threads: usize) -> PyResu
     let cs = build(spec, &mut keep)?;
     let mut chunks: Vec<Vec<u8>> = vec![];
     py.detach(|| {
-        cs.write_chunks(WriteOptions { threads }, &mut |c| {
+        cs.write_chunks(WriteOptions::with_threads(threads), &mut |c| {
             chunks.push(c);
             Ok(())
         })
@@ -281,6 +341,7 @@ pub fn parse_request_py<'py>(py: Python<'py>, body: &[u8]) -> PyResult<Bound<'py
     let r = parse_request(body).map_err(|e| match e {
         arrow2xmla::ParseError::Doctype => PyValueError::new_err("doctype"),
         arrow2xmla::ParseError::NotXml(m) => PyValueError::new_err(format!("not_xml: {m}")),
+        other => PyValueError::new_err(format!("not_xml: {other}")),
     })?;
     let out = PyDict::new(py);
     let (kind, id) = match r.session {
@@ -288,6 +349,7 @@ pub fn parse_request_py<'py>(py: Python<'py>, body: &[u8]) -> PyResult<Bound<'py
         Session::Begin => ("begin", None),
         Session::Use(i) => ("use", Some(i)),
         Session::End(i) => ("end", i),
+        _ => ("none", None),
     };
     out.set_item("session", (kind, id))?;
     let call = PyDict::new(py);
@@ -303,7 +365,7 @@ pub fn parse_request_py<'py>(py: Python<'py>, body: &[u8]) -> PyResult<Bound<'py
             call.set_item("statement", statement)?;
             call.set_item("properties", properties)?;
         }
-        Call::Other => call.set_item("kind", "other")?,
+        _ => call.set_item("kind", "other")?,
     }
     out.set_item("call", call)?;
     Ok(out)
