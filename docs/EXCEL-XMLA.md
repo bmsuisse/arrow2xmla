@@ -79,3 +79,22 @@ This is what `Cellset.to_xml()` writes. How the pieces line up:
 
 To record more: run a PivotTable against any endpoint and capture the HTTP bodies; each request goes into
 `tests/fixtures/excel/` and is picked up by the parity and end-to-end tests.
+
+## Official documents, and what we check against
+
+- [XML for Analysis Specification](https://msdn.microsoft.com/en-us/library/ms977626(v=msdn.10)) (XMLA 1.0; Analysis
+  Services is [compliant with 1.1](https://technet.microsoft.com/sqlserver/ms187125(v=sql.100)) and extends it).
+- [MS-SSAS](https://learn.microsoft.com/en-us/openspecs/sql_server_protocols/MS-SSAS/68a9475e-27d6-413a-9786-95bb19652b19):
+  the protocol document; it lists the `mddataset`, `rowset` and `exception` namespaces.
+- [XMLA reference](https://learn.microsoft.com/analysis-services/xmla/xml-for-analysis-xmla-reference).
+
+Checks that use them:
+
+- **Schema validation** (`tests/e2e/test_schema.py`, optional: `uv run --with lxml pytest tests/e2e/test_schema.py`).
+  Answers are validated against the `mddataset` schema, fetched from a public mirror rather than vendored
+  (`tests/e2e/schemas.py`). The mirror's copy is lossy and is patched in two places, so this checks the structure and the
+  cell ordinals, not the typed values; mutated answers are shown to fail.
+- **Replay and read-back** (`tests/e2e`): the recorded Excel requests against a mock endpoint, answers read like a client.
+- **Not done**: an independent client. The Python `xmla` package targets Python 2 and does not run on a current Python;
+  olap4j (Java) would, and needs a JDK. Mondrian's XMLA tests hold expected request/response pairs (including for older
+  Excel) that could be mined.
