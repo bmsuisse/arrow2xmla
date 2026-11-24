@@ -71,3 +71,16 @@ def test_every_tuple_axis_with_properties_is_valid(schema) -> None:
 def test_the_check_does_catch_a_broken_answer(schema, mutate) -> None:
     t = Table(pa.array(["a"]), pa.array([1.0, 2.0]), pa.array([1, 2]))
     assert not schema.validate(etree.fromstring(mutate(t.cellset().to_xml())))
+
+
+def test_a_rowset_is_valid_without_its_schema_block(schema) -> None:
+    """The mirror's rowset schema describes `<root><row>...` and has no place for the inline schema block real servers
+    send, so the block is taken out before validating: this checks the rows and the namespaces."""
+    from schemas import fetch  # noqa: F401
+
+    directory = Path(os.environ.get("XMLA_SCHEMA_DIR", Path(__file__).parent / ".schema-cache"))
+    rs = etree.XMLSchema(etree.parse(str(directory / "rowset-patched.xsd")))
+    doc = etree.fromstring(ax.Rowset.from_columns({"CUBE_NAME": pa.array(["Sales", "a&b"]), "N": pa.array([1, None])}).to_xml())
+    for block in doc.findall("{http://www.w3.org/2001/XMLSchema}schema"):
+        doc.remove(block)
+    assert rs.validate(doc), "\n".join(str(e) for e in list(rs.error_log)[:3])

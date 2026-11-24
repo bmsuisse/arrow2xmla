@@ -51,17 +51,18 @@ class Table:
         )
 
 
-def envelope(body: str, session: str | None) -> bytes:
-    head = f'<soap:Header><Session xmlns="{XA}" SessionId="{session}"/></soap:Header>' if session else ""
-    return f'<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:soap="{SOAP}">{head}<soap:Body>{body}</soap:Body></soap:Envelope>'.encode()
-
-
-def rowset(rows: list[dict]) -> str:
-    """A Discover answer: `<root>` of `<row>`s (the rowset schema block is left out; clients read the rows by name)."""
-    from xml.sax.saxutils import escape
-
-    body = "".join("<row>" + "".join(f"<{k}>{escape(str(v))}</{k}>" for k, v in r.items() if v is not None) + "</row>" for r in rows)
-    return f'<root xmlns="{ROWSET}" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="{XSI}">{body}</root>'
+def rowset(rows: list[dict]) -> bytes:
+    """A Discover answer written by the library: the columns are the keys, in order of first appearance."""
+    names = list(dict.fromkeys(k for r in rows for k in r))
+    columns = []
+    for name in names:
+        values = [None if r.get(name) is None else r[name] for r in rows]
+        if all(v is None or isinstance(v, str) for v in values):
+            boolean = all(v in (None, "true", "false") for v in values) and any(v is not None for v in values)
+            columns.append(ax.RowsetColumn(name, pa.array(values, pa.string()), "xsd:boolean" if boolean else None))
+        else:
+            columns.append(ax.RowsetColumn(name, pa.array(values, pa.int64())))
+    return ax.Rowset(columns).to_xml()
 
 
 def metadata(customers: list[str | None], cube: str = "Sales", catalog: str = "Demo") -> dict[str, list[dict]]:
@@ -105,12 +106,6 @@ def metadata(customers: list[str | None], cube: str = "Sales", catalog: str = "D
     }
 
 
-def fault(message: str) -> bytes:
-    from xml.sax.saxutils import escape
-
-    return f'<?xml version="1.0"?><soap:Envelope xmlns:soap="{SOAP}"><soap:Body><soap:Fault><faultcode>XMLAnalysisError.0xc10e0000</faultcode><faultstring>{escape(message)}</faultstring></soap:Fault></soap:Body></soap:Envelope>'.encode()
-
-
 class Server:
     """`with Server(table) as url:` serves XMLA on a free local port."""
 
@@ -137,7 +132,7 @@ class Server:
         try:
             req = ax.parse_request(body, max_size=1 << 20)
         except ax.XmlaError as e:
-            return 500, fault(str(e))
+            return 500, ax.fault(str(e))
         self.seen.append(req)
         session = {ax.SessionKind.BEGIN: "mock-session"}.get(req.session.kind, req.session.id)
         call = req.call
@@ -145,13 +140,14 @@ class Server:
             rows = self.meta.get(call.request_type, [])
             for name, values in call.restrictions:  # a restriction keeps the rows whose column equals one of its values
                 rows = [r for r in rows if r.get(name) is None or r[name] in values]
-            return 200, envelope(f'<DiscoverResponse xmlns="{XA}"><return>{rowset(rows)}</return></DiscoverResponse>', session)
+            return 200, ax.Envelope(ax.Method.DISCOVER, session).wrap(rowset(rows))
         if isinstance(call, ax.Execute):
+            envelope = ax.Envelope(ax.Method.EXECUTE, session)
             if not call.statement.strip():  # Excel's empty Execute that opens a session
-                return 200, envelope(f'<ExecuteResponse xmlns="{XA}"><return><root xmlns="{MD}"/></return></ExecuteResponse>', session)
-            cells = self.table.cellset().to_xml(self.threads).decode()
-            return 200, envelope(f'<ExecuteResponse xmlns="{XA}"><return>{cells}</return></ExecuteResponse>', session)
-        return 500, fault("only Discover and Execute are supported")
+                return 200, envelope.wrap(f'<root xmlns="{MD}"/>'.encode())
+            # streamed: the head, the answer as it is written, the tail
+            return 200, b"".join([envelope.head(), *self.table.cellset().iter_xml(self.threads), envelope.tail()])
+        return 500, ax.fault("only Discover and Execute are supported", session=session)
 
     def __enter__(self) -> str:
         threading.Thread(target=self.http.serve_forever, daemon=True).start()

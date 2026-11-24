@@ -3,7 +3,7 @@
 
 use std::ffi::{c_char, c_void, CStr};
 
-use arrow2xmla::{Array, Axis, CellProp, Cellset, Column, LevelAxis, Member, MemberProp, MemberType, Tuples, Values, WriteOptions};
+use arrow2xmla::{Array, Axis, CellProp, Cellset, Column, Envelope, Fault, LevelAxis, Member, MemberProp, MemberType, Method, Rowset, RowsetColumn, Tuples, Values, WriteOptions};
 use pyo3::create_exception;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -11,7 +11,7 @@ use pyo3::types::{PyBytes, PyCapsule, PyCapsuleMethods};
 
 // The exceptions; they are a hierarchy under ValueError, which the Python package re-exports.
 create_exception!(_native, XmlaError, PyValueError, "Anything this package refuses.");
-create_exception!(_native, CellsetError, XmlaError, "A cellset that is not valid: wrong shapes, bad arrays, unknown names.");
+create_exception!(_native, CellsetError, XmlaError, "A cellset or rowset that is not valid: wrong shapes, bad arrays, unknown names.");
 create_exception!(_native, UnsupportedTypeError, CellsetError, "An Arrow type that is not written.");
 create_exception!(_native, RequestError, XmlaError, "A request that is not accepted.");
 create_exception!(_native, DoctypeError, RequestError, "A request with a DOCTYPE.");
@@ -118,7 +118,7 @@ fn import<'a>(obj: &Bound<'_, PyAny>, keep: &mut Keep) -> PyResult<Array<'a>> {
         "g" | "f" | "e" | "l" | "i" | "s" | "c" | "L" | "I" | "S" | "C" => 2,
         "u" | "U" => 3,
         "vu" => 3,
-        other => return Err(bad(format!("an Arrow array of format {other:?} is not supported (floats, integers, text): cast it first"))),
+        other => return Err(UnsupportedTypeError::new_err(format!("an Arrow array of format {other:?} is not supported (floats, integers, text): cast it first"))),
     };
     if nb < need {
         return Err(bad("an Arrow array with too few buffers"));
@@ -265,10 +265,7 @@ fn cellset_xml<'py>(py: Python<'py>, cellset: &Bound<'py, PyAny>, threads: usize
             Ok(())
         })
     })
-    .map_err(|e| match e {
-        arrow2xmla::Error::Unsupported(m) => UnsupportedTypeError::new_err(m),
-        other => CellsetError::new_err(other.to_string()),
-    })?;
+    .map_err(cellset_error)?;
     drop(cs);
     drop(keep);
     let total = chunks.iter().map(Vec::len).sum();
@@ -280,6 +277,112 @@ fn cellset_xml<'py>(py: Python<'py>, cellset: &Bound<'py, PyAny>, threads: usize
         }
         Ok(())
     })
+}
+
+/// `cellset_write(cellset, write, threads=0)`: the answer in chunks of about 1 MB, each handed to `write(bytes)` as it is
+/// made, so the whole answer never exists in memory. An error of `write` is raised as it is.
+#[pyfunction]
+#[pyo3(signature = (cellset, write, threads=0))]
+fn cellset_write(py: Python<'_>, cellset: &Bound<'_, PyAny>, write: &Bound<'_, PyAny>, threads: usize) -> PyResult<()> {
+    let mut keep = Keep::default();
+    let cs = build(cellset, &mut keep)?;
+    let write: Py<PyAny> = write.clone().unbind();
+    let mut raised: Option<PyErr> = None;
+    let result = py.detach(|| {
+        cs.write_chunks(WriteOptions::with_threads(threads), &mut |chunk| {
+            Python::attach(|py| {
+                // a writer may take less than it is given (a socket, a pipe): the rest goes again; one that returns
+                // nothing is taken to have written it all
+                let mut sent = 0;
+                let outcome = loop {
+                    if let Err(e) = py.check_signals() {
+                        break Err(e);
+                    }
+                    let part = PyBytes::new(py, &chunk[sent..]);
+                    match write.call1(py, (part,)).and_then(|n| n.extract::<Option<usize>>(py)) {
+                        Ok(Some(n)) if n < chunk.len() - sent => {
+                            if n == 0 {
+                                break Err(CellsetError::new_err("the writer took no bytes (write returned 0)"));
+                            }
+                            sent += n;
+                        }
+                        Ok(_) => break Ok(()),
+                        Err(e) => break Err(e),
+                    }
+                };
+                outcome.map_err(|e| {
+                    raised = Some(e);
+                    arrow2xmla::Error::Io(std::io::Error::other("the writer raised"))
+                })
+            })
+        })
+    });
+    drop(cs);
+    drop(keep);
+    match (raised, result) {
+        (Some(e), _) => Err(e),
+        (None, Err(e)) => Err(cellset_error(e)),
+        (None, Ok(())) => Ok(()),
+    }
+}
+
+fn cellset_error(e: arrow2xmla::Error) -> PyErr {
+    match e {
+        arrow2xmla::Error::Unsupported(m) => UnsupportedTypeError::new_err(m),
+        other => CellsetError::new_err(other.to_string()),
+    }
+}
+
+/// `rowset_xml(rowset) -> bytes` (a `Rowset` of `arrow2xmla._model`).
+#[pyfunction]
+fn rowset_xml<'py>(py: Python<'py>, rowset: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
+    let mut keep = Keep::default();
+    let mut rs = Rowset::new();
+    for c in attr(rowset, "columns")?.try_iter()? {
+        let c = c?;
+        let mut col = RowsetColumn::new(attr(&c, "name")?.extract::<String>()?, import(&attr(&c, "values")?, &mut keep)?);
+        let t = attr(&c, "xsd_type")?;
+        if !t.is_none() {
+            col.xsd_type = Some(t.extract()?);
+        }
+        rs.columns.push(col);
+    }
+    let out = py.detach(|| rs.to_vec()).map_err(cellset_error)?;
+    drop(rs);
+    drop(keep);
+    Ok(PyBytes::new(py, &out))
+}
+
+fn method(name: &str) -> PyResult<Method> {
+    match name {
+        "Discover" => Ok(Method::Discover),
+        "Execute" => Ok(Method::Execute),
+        other => Err(XmlaError::new_err(format!("method {other:?} is not Discover or Execute"))),
+    }
+}
+
+/// `envelope(method, session, part, body)`: `part` is "head", "tail" or "wrap" (then `body` is wrapped).
+#[pyfunction]
+#[pyo3(signature = (method_name, session, part, body=None))]
+fn envelope<'py>(py: Python<'py>, method_name: &str, session: Option<String>, part: &str, body: Option<&[u8]>) -> PyResult<Bound<'py, PyBytes>> {
+    let mut e = Envelope::new(method(method_name)?);
+    e.session = session;
+    let bytes = match part {
+        "head" => e.head(),
+        "tail" => e.tail(),
+        _ => e.wrap(body.unwrap_or_default()),
+    };
+    Ok(PyBytes::new(py, &bytes))
+}
+
+/// `fault(message, code, source, session) -> bytes`
+#[pyfunction]
+fn fault<'py>(py: Python<'py>, message: String, code: u32, source: String, session: Option<String>) -> Bound<'py, PyBytes> {
+    let mut f = Fault::new(message);
+    f.code = code;
+    f.source = source;
+    f.session = session;
+    PyBytes::new(py, &f.to_vec())
 }
 
 #[cfg(feature = "request")]
@@ -333,6 +436,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cellset_xml, m)?)?;
     #[cfg(feature = "request")]
     m.add("DEFAULT_MAX_REQUEST", arrow2xmla::DEFAULT_MAX_REQUEST)?;
+    m.add_function(wrap_pyfunction!(cellset_write, m)?)?;
+    m.add_function(wrap_pyfunction!(rowset_xml, m)?)?;
+    m.add_function(wrap_pyfunction!(envelope, m)?)?;
+    m.add_function(wrap_pyfunction!(fault, m)?)?;
     m.add("XmlaError", m.py().get_type::<XmlaError>())?;
     m.add("CellsetError", m.py().get_type::<CellsetError>())?;
     m.add("UnsupportedTypeError", m.py().get_type::<UnsupportedTypeError>())?;

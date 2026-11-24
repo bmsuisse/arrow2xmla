@@ -60,8 +60,8 @@ This is what `Cellset.to_xml()` writes. How the pieces line up:
 |---|---|
 | Request parsing: session, restrictions, properties, statement | done (`parse_request`) |
 | MDDataset cellset | done (`Cellset`), byte-for-byte against a reference writer |
-| SOAP envelope and fault around an answer | **not yet**: the example server in `tests/e2e/xmla_mock.py` shows the shape |
-| Rowsets for the `Discover` requests above | **not yet** |
+| SOAP envelope and fault around an answer | done (`Envelope`, `fault`), read by olap4j; untested against Excel |
+| Rowsets for the `Discover` requests above | the writer is done (`Rowset`, with the schema block); the content is the server's catalog |
 | MDX parser / evaluator | out of scope |
 | Binary XML (`sx`) and Xpress compression, which MSOLAP can negotiate | not yet; plain XML is accepted |
 

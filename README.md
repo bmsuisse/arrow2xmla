@@ -3,6 +3,7 @@
 <p align="center">
   <b>Arrow in, XMLA out.</b><br>
   Write the cellsets an OLAP client such as Excel's PivotTable reads, straight from columnar data, and parse its requests.<br>
+  Cellsets, rowsets, SOAP envelopes and faults from Arrow, request parsing, streaming output.<br>
   Pure Rust core · Python binding · no engine, no catalog, no runtime dependencies.
 </p>
 
@@ -63,7 +64,7 @@ Arrow PyCapsule interface works (`pyarrow`, `nanoarrow`, ...; a `polars` Series 
 
 ```toml
 # Cargo.toml (Rust 1.88+)
-arrow2xmla = "0.1"
+arrow2xmla = "0.2"
 ```
 
 ## Quick start
@@ -115,6 +116,56 @@ cellset.columns.push(Column::new(Array::new(Values::F64(&amounts)), "#,##0.00"))
 let xml = cellset.to_vec()?;   // or cellset.write_to(&mut writer), or write_chunks(..) for a stream of ~1 MB chunks
 ```
 
+## A server
+
+The three writers (cellset, rowset, fault) and the envelope are all a server needs next to `parse_request`; what it
+answers with is up to it. This is the shape of one (the mock endpoint in
+[`tests/e2e/xmla_mock.py`](tests/e2e/xmla_mock.py) is a complete one, read by olap4j in the tests):
+
+```python
+import itertools
+import pyarrow as pa
+import arrow2xmla as ax
+
+def answer(body: bytes):
+    """-> (HTTP status, an iterable of bytes)"""
+    try:
+        request = ax.parse_request(body, max_size=1 << 20)
+    except ax.XmlaError as e:
+        return 500, [ax.fault(str(e))]
+    session = "new-id" if request.session.kind is ax.SessionKind.BEGIN else request.session.id
+    match request.call:
+        case ax.Discover(request_type="MDSCHEMA_CUBES"):
+            rows = ax.Rowset.from_columns({"CUBE_NAME": pa.array(["Sales"]), "CUBE_TYPE": pa.array(["CUBE"])})
+            return 200, [ax.Envelope(ax.Method.DISCOVER, session).wrap(rows.to_xml())]
+        case ax.Execute(statement=mdx):
+            envelope = ax.Envelope(ax.Method.EXECUTE, session)
+            cellset = run(mdx)  # your engine: an ax.Cellset over its Arrow results
+            return 200, itertools.chain([envelope.head()], cellset.iter_xml(), [envelope.tail()])   # lazy: ~1 MB in memory
+    return 500, [ax.fault("not supported", session=session)]
+```
+
+### Streaming
+
+`to_xml()` builds the whole answer (about twice its size in memory at the peak). For a big one:
+
+```python
+with open("answer.xml", "wb") as fp:
+    cellset.write_to(fp)          # chunks of ~1 MB as they are made
+
+for chunk in cellset.iter_xml():  # or as an iterator, written ahead on another thread (e.g. a streaming response)
+    ...
+```
+
+| 330 MB answer (600 000 rows × 3 measures) | Memory the process grows by |
+|---|---:|
+| `to_xml()` | 630 MB |
+| `write_to(sink)` / `iter_xml()` | **22 MB** |
+
+Everything that can be checked is checked before the first chunk, so a response that streams does not start with an invalid
+cellset; an error of the sink itself (a closed socket) is raised as it is, mid-stream. A sink that takes part of a chunk
+is offered the rest; closing or dropping the iterator stops the writer.
+
 ## The model
 
 | Piece | What it is |
@@ -123,6 +174,8 @@ let xml = cellset.to_vec()?;   // or cellset.write_to(&mut writer), or write_chu
 | `LevelAxis` | The values of **one level**, read from an Arrow text column. The fast form for big axes: unique name `<hierarchy>.&[key]` and caption are made from the key; a null key is the blank member. Optional All member. |
 | `TupleAxis` | **Explicit tuples**: the distinct members once, each tuple as indices into them. `from_tuples` builds one from tuples of members. `DISPLAY_INFO` (children, drilled down, same parent) is worked out for you. |
 | `CellValues` | One **column of cells**: an Arrow array and its number format. A null is a cell with no value. |
+| `Rowset` | The answer to a `Discover`: Arrow columns written with the schema block clients read the column types from (`RowsetColumn` to override a type, e.g. `xsd:boolean`). |
+| `Envelope`, `fault` | The SOAP around an answer (`head()` / `tail()` for a streamed one), and the fault for a request that failed. |
 | `Cellset` | The answer to an MDX `Execute`: a cube name, the axes, the cell columns, an optional slicer (`WHERE`), the cell properties and the language. |
 
 A cell's ordinal is `row * len(values) + column`. The axes must list exactly those cells, or the call is refused before a
@@ -201,13 +254,13 @@ The output is byte-identical to a plain Python implementation, which is what the
 Real Excel for Windows is the one client that cannot be run in CI: the request fixtures are recordings of it, and the mock
 client stands in for it.
 
-What Excel sends and expects, from the recorded session: [`docs/EXCEL-XMLA.md`](docs/EXCEL-XMLA.md).
+What Excel sends and expects, from the recorded session: [`docs/EXCEL-XMLA.md`](docs/EXCEL-XMLA.md). Changes: [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Not built yet
 
-SOAP envelope and fault writers, the `Discover` rowset writers, an MDX parser, binary XML (`sx`) and Xpress compression,
-and a true streaming API (today a cellset is built in ~1 MB chunks and joined, so peak memory is about twice the
-answer). The Rust `write_chunks` already hands chunks to a sink as they are made; Python returns the whole answer.
+An MDX parser and evaluator (the engine's job), binary XML (`sx`) and Xpress compression, which MSOLAP can negotiate (plain
+XML is accepted), and the rowsets' *content*: what `MDSCHEMA_CUBES` and friends hold is the server's catalog, written with
+`Rowset`. Real Excel and Power BI are untested ([`docs/EXCEL-XMLA.md`](docs/EXCEL-XMLA.md)).
 
 ## Develop
 

@@ -10,12 +10,16 @@ mod display;
 mod esc;
 mod float;
 mod model;
+mod rowset;
+mod soap;
 #[cfg(feature = "request")]
 mod request;
 
 pub use array::{Array, Validity, Values};
 pub use cellset::WriteOptions;
 pub use model::*;
+pub use rowset::{Rowset, RowsetColumn, ROWSET_NS};
+pub use soap::{Envelope, Fault, Method};
 #[cfg(feature = "request")]
 pub use request::{parse_request, parse_request_limited, Call, ParseError, Request, Session, DEFAULT_MAX_REQUEST};
 
@@ -54,6 +58,63 @@ impl From<std::io::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn envelope_wraps_and_streams_the_same_bytes() {
+        let e = Envelope::new(Method::Execute).with_session("a\"b&c");
+        let whole = String::from_utf8(e.wrap(b"<x/>")).unwrap();
+        assert!(whole.contains("<Session xmlns=\"urn:schemas-microsoft-com:xml-analysis\" SessionId='a\"b&amp;c'/>"), "{whole}");
+        assert!(whole.contains("<ExecuteResponse xmlns=\"urn:schemas-microsoft-com:xml-analysis\"><return><x/></return></ExecuteResponse>"));
+        assert_eq!(e.wrap(b"<x/>"), [e.head(), b"<x/>".to_vec(), e.tail()].concat());
+        assert!(!String::from_utf8(Envelope::new(Method::Discover).wrap(b"")).unwrap().contains("<soap:Header>"));
+    }
+
+    #[test]
+    fn a_fault_escapes_its_message() {
+        let mut f = Fault::new("bad <MDX> & \"quotes\"");
+        f.code = 0xC10E_0000;
+        let xml = String::from_utf8(f.to_vec()).unwrap();
+        assert!(xml.contains("<faultcode>XMLAnalysisError.0xc10e0000</faultcode>"));
+        assert!(xml.contains("<faultstring>bad &lt;MDX&gt; &amp; \"quotes\"</faultstring>"));
+        assert!(xml.contains("ErrorCode=\"3238920192\""));
+    }
+
+    #[test]
+    fn a_rowset_has_its_schema_and_rows() {
+        let (offsets, data) = text(&["Sales", "a&b"]);
+        let (fo, fd) = text(&["true", "false"]);
+        let rs = Rowset::new()
+            .with_column(RowsetColumn::new("CUBE_NAME", Array::new(Values::Utf8 { offsets: &offsets, data: &data })))
+            .with_column(RowsetColumn::new("ID", Array::new(Values::I64(&[7, 8])).with_validity(&[0b01], 0)))
+            .with_column({
+                let mut c = RowsetColumn::new("IS_VIRTUAL", Array::new(Values::Utf8 { offsets: &fo, data: &fd }));
+                c.xsd_type = Some("xsd:boolean".into());
+                c
+            });
+        let xml = String::from_utf8(rs.to_vec().unwrap()).unwrap();
+        assert!(xml.contains("<xsd:element sql:field=\"CUBE_NAME\" name=\"CUBE_NAME\" type=\"xsd:string\" minOccurs=\"0\"/>"));
+        assert!(xml.contains("name=\"ID\" type=\"xsd:long\""));
+        assert!(xml.contains("name=\"IS_VIRTUAL\" type=\"xsd:boolean\""));
+        assert!(xml.contains("<row><CUBE_NAME>Sales</CUBE_NAME><ID>7</ID><IS_VIRTUAL>true</IS_VIRTUAL></row>"));
+        assert!(xml.contains("<row><CUBE_NAME>a&amp;b</CUBE_NAME><IS_VIRTUAL>false</IS_VIRTUAL></row>"), "a null is left out: {xml}");
+        assert!(xml.ends_with("</row></root>"));
+    }
+
+    #[test]
+    fn a_rowset_refuses_bad_names_and_lengths() {
+        let one = || Array::new(Values::I64(&[1]));
+        for bad in ["", "1A", "A B", "A<", "é"] {
+            assert!(Rowset::new().with_column(RowsetColumn::new(bad, one())).validate().is_err(), "{bad:?}");
+        }
+        assert!(Rowset::new().with_column(RowsetColumn::new("A", one())).with_column(RowsetColumn::new("A", one())).validate().is_err());
+        assert!(Rowset::new().with_column(RowsetColumn::new("A", one())).with_column(RowsetColumn::new("B", Array::new(Values::I64(&[1, 2])))).validate().is_err());
+        assert!(Rowset::new().to_vec().unwrap().ends_with(b"</root>"), "no columns: no rows");
+        for bad in ["", "boolean", "xsd:", "xsd:a\"/><x/>", "xsd:int32", "x sd:int"] {
+            let mut c = RowsetColumn::new("A", one());
+            c.xsd_type = Some(bad.into());
+            assert!(Rowset::new().with_column(c).validate().is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn axis_rules() {

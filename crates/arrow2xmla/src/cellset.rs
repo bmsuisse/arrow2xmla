@@ -115,10 +115,7 @@ impl Writer<'_> {
         let chunks = n.div_ceil(rows_per_chunk);
         let range = |c: usize| c * rows_per_chunk..((c + 1) * rows_per_chunk).min(n);
         let want = if n.saturating_mul(weight) < PAR_MIN_WORK { 1 } else { self.threads.min(chunks) };
-        let lease = if want > 1 { Lease::take(want) } else { Lease(0) };
-        let threads = lease.0;
-        if threads <= 1 {
-            drop(lease);
+        if want <= 1 {
             for c in 0..chunks {
                 let mut buf = Vec::with_capacity(rows_per_chunk * bytes_per_row);
                 f(range(c), &mut buf);
@@ -126,7 +123,7 @@ impl Writer<'_> {
             }
             return Ok(());
         }
-        let wave = threads * 4; // chunks in flight at once: bounds what is held
+        let wave = want * 4; // chunks in flight at once: bounds what is held
         let mut first = 0;
         while first < chunks {
             let last = (first + wave).min(chunks);
@@ -141,13 +138,17 @@ impl Writer<'_> {
                 f(range(c), &mut buf);
                 *done[c - first].lock().expect("a worker panicked") = Some(buf);
             };
+            // the threads are leased for the rendering of one wave only: while the sink is busy (a slow reader of a
+            // stream) they are free for other answers
+            let lease = Lease::take(want);
             std::thread::scope(|s| {
-                for _ in 1..threads {
+                for _ in 1..lease.0 {
                     // a thread that cannot start is not an error: the others take its chunks
                     let _ = std::thread::Builder::new().spawn_scoped(s, work);
                 }
                 work();
             });
+            drop(lease);
             for slot in done {
                 (self.sink)(slot.into_inner().expect("a worker panicked").expect("every chunk is rendered"))?;
             }

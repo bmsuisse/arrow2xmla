@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import atexit
+import queue
+import threading
+import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
@@ -68,6 +72,104 @@ def _enums(kind: type[Enum], items: Any, what: str, one: str) -> tuple[Any, ...]
         except ValueError:
             raise CellsetError(f"unknown {one} {i!r} (one of {', '.join(m.value for m in kind)})") from None
     return tuple(out)
+
+
+def _threads(threads: object) -> int:
+    if isinstance(threads, bool) or not isinstance(threads, int) or threads < 0:
+        raise ValueError(f"threads is a number of threads, 0 or more (0: the machine's cores), not {threads!r}")
+    return min(threads, 1 << 16)
+
+
+class _Stopped(Exception):
+    """The consumer of `iter_xml` stopped before the end."""
+
+
+class _Sink:
+    def __init__(self, write: Any) -> None:
+        self.write = write
+
+
+_live: weakref.WeakSet[ChunkIterator] = weakref.WeakSet()
+
+
+def _stop_all() -> None:
+    for it in list(_live):
+        it.close()
+
+
+atexit.register(_stop_all)
+
+
+class ChunkIterator:
+    """The chunks of an answer, written ahead on a worker thread (`Cellset.iter_xml`). Closing it, using it up or dropping
+    it stops the worker; it is also a context manager."""
+
+    def __init__(self, cellset: Cellset, threads: int, buffer: int) -> None:
+        self._chunks: queue.Queue[Any] = queue.Queue(maxsize=buffer)
+        self._stop = threading.Event()
+        self._done = False
+        chunks, stop = self._chunks, self._stop  # the worker holds these, not the iterator: dropping it is noticed
+        finished = object()
+        self._finished = finished
+
+        def put(chunk: Any) -> None:
+            while not stop.is_set():
+                try:
+                    chunks.put(chunk, timeout=0.1)
+                    return
+                except queue.Full:
+                    continue
+            raise _Stopped
+
+        def run() -> None:
+            try:
+                cellset.write_to(_Sink(put), threads)
+                put(finished)
+            except _Stopped:
+                pass
+            except BaseException as e:  # noqa: BLE001: handed to the consumer
+                try:
+                    put(e)
+                except _Stopped:
+                    pass
+
+        self._worker = threading.Thread(target=run, daemon=True, name="arrow2xmla-writer")
+        _live.add(self)
+        self._worker.start()
+
+    def __iter__(self) -> ChunkIterator:
+        return self
+
+    def __next__(self) -> bytes:
+        if self._done:
+            raise StopIteration
+        item = self._chunks.get()
+        if item is self._finished:
+            self.close()
+            raise StopIteration
+        if isinstance(item, BaseException):
+            self.close()
+            raise item
+        return item
+
+    def close(self) -> None:
+        """Stops the writer (the chunks not yet read are dropped)."""
+        self._done = True
+        self._stop.set()
+        if self._worker is not threading.current_thread():
+            self._worker.join()
+        _live.discard(self)
+
+    def __enter__(self) -> ChunkIterator:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        stop = getattr(self, "_stop", None)
+        if stop is not None:
+            stop.set()
 
 
 def _set(obj: Any, name: str, value: Any) -> None:
@@ -216,12 +318,28 @@ class Cellset:
 
     def to_xml(self, threads: int = 0) -> bytes:
         """The answer as bytes. `threads`: 0 uses the machine's cores (at most 8, and never more than are free: many
-        answers written at once share them), 1 stays on the calling thread."""
+        answers written at once share them), 1 stays on the calling thread. The whole answer is in memory (about
+        twice its size at the peak): for a big one, `write_to` or `iter_xml` hold about a megabyte."""
         from arrow2xmla import _native
 
-        if isinstance(threads, bool) or not isinstance(threads, int) or threads < 0:
-            raise ValueError(f"threads is a number of threads, 0 or more (0: the machine's cores), not {threads!r}")
-        return _native.cellset_xml(self, min(threads, 1 << 16))
+        return _native.cellset_xml(self, _threads(threads))
+
+    def write_to(self, fp: Any, threads: int = 0) -> None:
+        """Writes the answer to `fp.write(bytes)` in chunks of about 1 MB as they are made, so it never exists whole in
+        memory. Whatever is wrong with the cellset is raised before the first chunk; an error of `fp.write` is raised
+        as it is."""
+        from arrow2xmla import _native
+
+        _native.cellset_write(self, fp.write, _threads(threads))
+
+    def iter_xml(self, threads: int = 0, buffer: int = 4) -> ChunkIterator:
+        """The answer as an iterator of chunks of about 1 MB, written ahead on another thread (at most `buffer` chunks
+        ahead). For a streaming response: it is lazy, so pass it on without `list()` or `*`. Whatever is wrong with the
+        cellset is raised by the first `next()`. The writer stops when the iterator is closed, used up or dropped."""
+        _threads(threads)
+        if isinstance(buffer, bool) or not isinstance(buffer, int) or buffer < 1:
+            raise ValueError(f"buffer is a number of chunks, 1 or more, not {buffer!r}")
+        return ChunkIterator(self, threads, buffer)
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> Cellset:
@@ -229,6 +347,57 @@ class Cellset:
         of `(array, format)`, members and axes dicts of their fields (`{"level": {...}}` or `{"tuples": [...]}`).
         An unknown key is an error."""
         return _cellset_from(d)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class RowsetColumn:
+    """One column of a rowset: its name (an XML name, e.g. `CUBE_NAME`) and an Arrow array, one value per row; a null is
+    left out of its row. The type declared to the client follows the array (text `xsd:string`, integers `xsd:int` /
+    `xsd:long`, floats `xsd:double`); `xsd_type` overrides it (`"xsd:boolean"` for text holding `true` / `false`). A
+    boolean array (pyarrow) is written as `true` / `false` and declared `xsd:boolean`."""
+
+    name: str
+    values: Any
+    xsd_type: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str):
+            raise TypeError("RowsetColumn.name is a str")
+        if self.xsd_type is not None and not isinstance(self.xsd_type, str):
+            raise TypeError("RowsetColumn.xsd_type is a str or None")
+        values = _plain(self.values)
+        if str(getattr(values, "type", None)) == "bool":  # the XMLA way: text `true` / `false`, declared `xsd:boolean`
+            import pyarrow as pa
+            import pyarrow.compute as pc
+
+            values = pc.if_else(values, pa.scalar("true"), pa.scalar("false"))
+            if self.xsd_type is None:
+                _set(self, "xsd_type", "xsd:boolean")
+        _set(self, "values", values)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Rowset:
+    """The answer to a `Discover` (cubes, dimensions, properties, ...): columns of Arrow arrays of one length."""
+
+    columns: Sequence[RowsetColumn]
+
+    def __post_init__(self) -> None:
+        columns = tuple(self.columns) if isinstance(self.columns, Sequence) and not isinstance(self.columns, (str, bytes)) else None
+        if columns is None or not all(isinstance(c, RowsetColumn) for c in columns):
+            raise TypeError("Rowset.columns is a sequence of RowsetColumn")
+        _set(self, "columns", columns)
+
+    @classmethod
+    def from_columns(cls, columns: Mapping[str, Any]) -> Rowset:
+        """From `{name: array}`, typed after the arrays."""
+        return cls([RowsetColumn(name, values) for name, values in columns.items()])
+
+    def to_xml(self) -> bytes:
+        """The rowset (`<root>` with its schema block and rows) as bytes; for `Envelope(Method.DISCOVER).wrap(...)`."""
+        from arrow2xmla import _native
+
+        return _native.rowset_xml(self)
 
 
 def _only(d: Mapping[str, Any], keys: tuple[str, ...], what: str) -> None:

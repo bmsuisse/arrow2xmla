@@ -76,7 +76,7 @@ checksum = "3e7574c4175cc731e0d26a8384bc25d455c5e220250988a772c1af843592444b"
 
 [[package]]
 name = "arrow2xmla"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "arrow2xmla-py"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow2xmla",
  "pyo3",

@@ -20,7 +20,8 @@ Everything this package refuses raises a subclass of `XmlaError` (itself a `Valu
 """
 
 from arrow2xmla import _native
-from arrow2xmla._model import CellProperty, Cellset, CellValues, LevelAxis, Member, MemberProperty, MemberType, TupleAxis
+from arrow2xmla._model import CellProperty, ChunkIterator, Cellset, CellValues, LevelAxis, Member, MemberProperty, MemberType, Rowset, RowsetColumn, TupleAxis
+from arrow2xmla._soap import Envelope, Method, fault
 from arrow2xmla._native import CellsetError, DoctypeError, RequestError, RequestTooLarge, UnsupportedTypeError, XmlaError
 
 try:
@@ -33,7 +34,7 @@ except Exception:  # not installed as a distribution (a source checkout)
 
 __all__ = [
     "__version__", "Cellset", "CellValues", "LevelAxis", "TupleAxis", "Member",
-    "MemberType", "MemberProperty", "CellProperty",
+    "MemberType", "MemberProperty", "CellProperty", "ChunkIterator", "Rowset", "RowsetColumn", "Envelope", "Method", "fault",
     "XmlaError", "CellsetError", "UnsupportedTypeError", "RequestError", "DoctypeError", "RequestTooLarge",
 ]  # fmt: skip
 
