@@ -1,12 +1,21 @@
-//! Python binding: `arrow2xmla._native.cellset_xml(spec)`. The spec is plain dicts and lists plus `pyarrow` arrays
-//! (passed through the Arrow C data interface, no copy).
+//! Python binding: `arrow2xmla._native.cellset_xml(cellset, threads)`. The cellset is an `arrow2xmla._model.Cellset`
+//! (read by attribute); its arrays come through the Arrow C data interface, no copy.
 
 use std::ffi::{c_char, c_void, CStr};
 
-use arrow2xmla::{Array, Axis, AxisSource, CellProperty, Cellset, Column, LevelAxis, Member, MemberProp, Tuples, Values, WriteOptions};
-use pyo3::exceptions::{PyKeyError, PyValueError};
+use arrow2xmla::{Array, Axis, CellProp, Cellset, Column, LevelAxis, Member, MemberProp, MemberType, Tuples, Values, WriteOptions};
+use pyo3::create_exception;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyCapsule, PyCapsuleMethods, PyDict, PyList};
+use pyo3::types::{PyBytes, PyCapsule, PyCapsuleMethods};
+
+// The exceptions; they are a hierarchy under ValueError, which the Python package re-exports.
+create_exception!(_native, XmlaError, PyValueError, "Anything this package refuses.");
+create_exception!(_native, CellsetError, XmlaError, "A cellset that is not valid: wrong shapes, bad arrays, unknown names.");
+create_exception!(_native, UnsupportedTypeError, CellsetError, "An Arrow type that is not written.");
+create_exception!(_native, RequestError, XmlaError, "A request that is not accepted.");
+create_exception!(_native, DoctypeError, RequestError, "A request with a DOCTYPE.");
+create_exception!(_native, RequestTooLarge, RequestError, "A request longer than max_size.");
 
 // The Arrow C data interface (https://arrow.apache.org/docs/format/CDataInterface.html), read through the PyCapsule
 // protocol (`__arrow_c_array__`): any Arrow-speaking library's arrays work, none is a dependency.
@@ -46,7 +55,7 @@ struct Keep {
 }
 
 fn bad(msg: impl Into<String>) -> PyErr {
-    PyValueError::new_err(msg.into())
+    CellsetError::new_err(msg.into())
 }
 
 /// `n` elements of `T` at `ptr` (an empty slice for 0; a null or misaligned pointer is an error otherwise).
@@ -175,122 +184,80 @@ fn import<'a>(obj: &Bound<'_, PyAny>, keep: &mut Keep) -> PyResult<Array<'a>> {
     }
 }
 
-fn get<'py>(d: &Bound<'py, PyDict>, k: &str) -> PyResult<Bound<'py, PyAny>> {
-    d.get_item(k)?.ok_or_else(|| PyKeyError::new_err(k.to_string()))
+// The model is read from the Python dataclasses (`arrow2xmla._model`) by attribute: they are the one description of
+// its shape, and they have checked the types. What the core's `validate()` knows, the core says.
+
+fn attr<'py>(o: &Bound<'py, PyAny>, name: &str) -> PyResult<Bound<'py, PyAny>> {
+    o.getattr(name)
 }
 
-const MEMBER_KEYS: [&str; 8] = [
-    "hierarchy", "unique_name", "caption", "level_name", "level_number", "parent_unique_name", "children_cardinality", "member_type",
-];
-
-fn member(d: &Bound<'_, PyDict>) -> PyResult<Member> {
-    for k in d.keys().iter() {
-        let k: String = k.extract()?;
-        if !MEMBER_KEYS.contains(&k.as_str()) {
-            return Err(PyValueError::new_err(format!("a member has no key {k:?} (keys: {})", MEMBER_KEYS.join(", "))));
-        }
-    }
-    let level_number: i32 = get(d, "level_number")?.extract()?;
-    if level_number < 0 {
-        return Err(PyValueError::new_err("level_number must not be negative"));
-    }
-    let opt = |k: &str| -> PyResult<Option<Bound<'_, PyAny>>> { d.get_item(k) };
-    Ok(Member {
-        hierarchy: get(d, "hierarchy")?.extract()?,
-        unique_name: opt("unique_name")?.map_or(Ok(String::new()), |v| v.extract())?,
-        caption: opt("caption")?.map_or(Ok(String::new()), |v| v.extract())?,
-        level_name: get(d, "level_name")?.extract()?,
-        level_number,
-        parent_unique_name: opt("parent_unique_name")?.map_or(Ok(String::new()), |v| v.extract())?,
-        children_cardinality: opt("children_cardinality")?.map_or(Ok(0), |v| v.extract())?,
-        member_type: opt("member_type")?.map_or(Ok(1), |v| v.extract())?,
-    })
+fn member(o: &Bound<'_, PyAny>) -> PyResult<Member> {
+    let mut m = Member::new(attr(o, "hierarchy")?.extract::<String>()?, attr(o, "level_name")?.extract::<String>()?, attr(o, "level_number")?.extract()?);
+    m.unique_name = attr(o, "unique_name")?.extract()?;
+    m.caption = attr(o, "caption")?.extract()?;
+    m.parent_unique_name = attr(o, "parent_unique_name")?.extract()?;
+    m.children_cardinality = attr(o, "children_cardinality")?.extract()?;
+    let code: u8 = attr(o, "member_type")?.extract()?;
+    m.member_type = MemberType::from_code(code).ok_or_else(|| CellsetError::new_err(format!("member_type {code} is not 1 (value), 2 (All), 3 (measure) or 4 (calculated)")))?;
+    Ok(m)
 }
 
-fn props(d: &Bound<'_, PyDict>) -> PyResult<Vec<MemberProp>> {
-    let Some(l) = d.get_item("properties")? else { return Ok(vec![]) };
-    let names = l.extract::<Vec<String>>()?;
-    for (i, n) in names.iter().enumerate() {
-        if names[..i].contains(n) {
-            return Err(PyValueError::new_err(format!("member property {n} twice")));
-        }
-    }
-    names
-        .iter()
-        .map(|n| MemberProp::from_name(n).ok_or_else(|| PyValueError::new_err(format!("unknown member property {n}"))))
-        .collect()
+/// The `.value` of each enum member of a sequence (`MemberProperty`, `CellProperty`).
+fn names(o: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    o.try_iter()?.map(|e| e?.getattr("value")?.extract::<String>()).collect()
 }
 
-fn axis<'a>(d: &Bound<'_, PyDict>, keep: &mut Keep) -> PyResult<Axis<'a>> {
-    let properties = props(d)?;
-    if let Some(l) = d.get_item("level")? {
-        let l = l.cast_into::<PyDict>()?;
-        let all = match l.get_item("all")? {
-            Some(a) if !a.is_none() => Some(member(a.cast()?)?),
-            _ => None,
-        };
-        let blank: String = l.get_item("blank_caption")?.map_or(Ok("(blank)".to_string()), |v| v.extract())?;
-        let level = LevelAxis { all, template: member(get(&l, "template")?.cast()?)?, keys: import(&get(&l, "keys")?, keep)?, blank_caption: blank };
-        return Ok(Axis { source: AxisSource::Level(Box::new(level)), properties });
-    }
-    let rows = get(d, "tuples")?;
-    let rows = rows.cast::<PyList>()?;
-    // either each tuple lists its member dicts, or `members` lists the distinct ones once and a tuple lists indices
-    let tuples = if let Some(members) = d.get_item("members")? {
-        let members = members.cast::<PyList>()?.iter().map(|m| member(m.cast()?)).collect::<PyResult<Vec<_>>>()?;
-        let tuples = rows.iter().map(|t| t.extract::<Vec<u32>>()).collect::<PyResult<Vec<_>>>()?;
-        Tuples { members, tuples }
+fn axis<'a>(o: &Bound<'_, PyAny>, keep: &mut Keep) -> PyResult<Axis<'a>> {
+    let is_level = o.is_instance(&o.py().import("arrow2xmla._model")?.getattr("LevelAxis")?)?;
+    let mut axis = if is_level {
+        // a LevelAxis
+        let all = attr(o, "all")?;
+        let mut level = LevelAxis::new(member(&attr(o, "template")?)?, import(&attr(o, "keys")?, keep)?);
+        level.all = if all.is_none() { None } else { Some(member(&all)?) };
+        level.blank_caption = attr(o, "blank_caption")?.extract()?;
+        Axis::level(level)
     } else {
-        Tuples::from_members(
-            rows.iter()
-                .map(|t| t.cast::<PyList>()?.iter().map(|m| member(m.cast()?)).collect::<PyResult<Vec<_>>>())
-                .collect::<PyResult<Vec<_>>>()?,
-        )
+        // a TupleAxis: the distinct members once, each tuple as indices into them
+        let members = attr(o, "members")?.try_iter()?.map(|m| member(&m?)).collect::<PyResult<Vec<_>>>()?;
+        let tuples = attr(o, "tuples")?.try_iter()?.map(|t| t?.extract::<Vec<u32>>()).collect::<PyResult<Vec<_>>>()?;
+        Axis::tuples(Tuples::new(members, tuples))
     };
-    Ok(Axis { source: AxisSource::Tuples(tuples), properties })
+    axis.properties = names(&attr(o, "properties")?)?
+        .iter()
+        .map(|n| MemberProp::from_name(n).ok_or_else(|| CellsetError::new_err(format!("unknown member property {n}"))))
+        .collect::<PyResult<_>>()?;
+    Ok(axis)
 }
 
-fn build<'a>(spec: &Bound<'_, PyDict>, keep: &mut Keep) -> PyResult<Cellset<'a>> {
-    let mut cs = Cellset::new(get(spec, "cube")?.extract::<String>()?);
-    if let Some(l) = spec.get_item("language")? {
-        if l.is_instance_of::<pyo3::types::PyBool>() {
-            return Err(PyValueError::new_err("language is a number (an LCID), not a bool"));
-        }
-        cs.language = l.extract()?;
-    }
-    if let Some(p) = spec.get_item("cell_properties")? {
-        let names = p.extract::<Vec<String>>()?;
-        for (i, n) in names.iter().enumerate() {
-            if names[..i].contains(n) {
-                return Err(PyValueError::new_err(format!("cell property {n} twice")));
-            }
-        }
-        cs.cell_properties = names
-            .iter()
-            .map(|n| CellProperty::standard(n).ok_or_else(|| PyValueError::new_err(format!("unknown cell property {n}"))))
-            .collect::<PyResult<_>>()?;
-    }
-    for a in get(spec, "axes")?.cast::<PyList>()?.iter() {
-        cs.axes.push(axis(a.cast()?, keep)?);
-    }
-    if let Some(s) = spec.get_item("slicer")? {
-        for m in s.cast::<PyList>()?.iter() {
-            cs.slicer.push(member(m.cast()?)?);
+fn build<'a>(cellset: &Bound<'_, PyAny>, keep: &mut Keep) -> PyResult<Cellset<'a>> {
+    let mut cs = Cellset::new(attr(cellset, "cube")?.extract::<String>()?);
+    cs.language = attr(cellset, "language")?.extract()?;
+    cs.cell_properties = names(&attr(cellset, "cell_properties")?)?
+        .iter()
+        .map(|n| CellProp::from_name(n).ok_or_else(|| CellsetError::new_err(format!("unknown cell property {n} (written: VALUE, FORMAT_STRING, LANGUAGE)"))))
+        .collect::<PyResult<_>>()?;
+    for name in ["columns_axis", "rows_axis"] {
+        let a = attr(cellset, name)?;
+        if !a.is_none() {
+            cs.axes.push(axis(&a, keep)?);
         }
     }
-    if let Some(c) = spec.get_item("columns")? {
-        for item in c.cast::<PyList>()?.iter() {
-            let (values, format): (Bound<'_, PyAny>, String) = item.extract()?;
-            cs.columns.push(Column { values: import(&values, keep)?, format });
-        }
+    for m in attr(cellset, "slicer")?.try_iter()? {
+        cs.slicer.push(member(&m?)?);
+    }
+    for v in attr(cellset, "values")?.try_iter()? {
+        let v = v?;
+        cs.columns.push(Column::new(import(&attr(&v, "values")?, keep)?, attr(&v, "format")?.extract::<String>()?));
     }
     Ok(cs)
 }
 
-/// The chunks of the answer. The views read the Python arrays, which `keep` holds until the chunks are made.
-fn chunks_of(py: Python<'_>, spec: &Bound<'_, PyDict>, threads: usize) -> PyResult<Vec<Vec<u8>>> {
+/// `cellset_xml(cellset, threads=0) -> bytes` (a `Cellset` of `arrow2xmla._model`): the answer whole. `threads`: 0 picks the machine's, 1 stays on this thread.
+#[pyfunction]
+#[pyo3(signature = (cellset, threads=0))]
+fn cellset_xml<'py>(py: Python<'py>, cellset: &Bound<'py, PyAny>, threads: usize) -> PyResult<Bound<'py, PyBytes>> {
     let mut keep = Keep::default();
-    let cs = build(spec, &mut keep)?;
+    let cs = build(cellset, &mut keep)?;
     let mut chunks: Vec<Vec<u8>> = vec![];
     py.detach(|| {
         cs.write_chunks(WriteOptions::with_threads(threads), &mut |c| {
@@ -298,17 +265,12 @@ fn chunks_of(py: Python<'_>, spec: &Bound<'_, PyDict>, threads: usize) -> PyResu
             Ok(())
         })
     })
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    .map_err(|e| match e {
+        arrow2xmla::Error::Unsupported(m) => UnsupportedTypeError::new_err(m),
+        other => CellsetError::new_err(other.to_string()),
+    })?;
     drop(cs);
     drop(keep);
-    Ok(chunks)
-}
-
-/// `cellset_xml(spec, threads=0) -> bytes`: the answer whole. `threads`: 0 picks the machine's, 1 stays on this thread.
-#[pyfunction]
-#[pyo3(signature = (spec, threads=0))]
-fn cellset_xml<'py>(py: Python<'py>, spec: &Bound<'py, PyDict>, threads: usize) -> PyResult<Bound<'py, PyBytes>> {
-    let chunks = chunks_of(py, spec, threads)?;
     let total = chunks.iter().map(Vec::len).sum();
     PyBytes::new_with(py, total, |buf| {
         let mut at = 0;
@@ -320,28 +282,21 @@ fn cellset_xml<'py>(py: Python<'py>, spec: &Bound<'py, PyDict>, threads: usize) 
     })
 }
 
-/// `cellset_xml_chunks(spec, threads=0) -> list[bytes]`: the same answer in chunks of about 1 MB.
-#[pyfunction]
-#[pyo3(signature = (spec, threads=0))]
-fn cellset_xml_chunks<'py>(py: Python<'py>, spec: &Bound<'py, PyDict>, threads: usize) -> PyResult<Vec<Bound<'py, PyBytes>>> {
-    Ok(chunks_of(py, spec, threads)?.iter().map(|c| PyBytes::new(py, c)).collect())
-}
-
 #[cfg(feature = "request")]
 mod request_py {
-    use arrow2xmla::{parse_request, Call, Session};
-    use pyo3::exceptions::PyValueError;
+    use arrow2xmla::{parse_request_limited, Call, Session};
     use pyo3::prelude::*;
     use pyo3::types::PyDict;
 
-/// `parse_request(body: bytes) -> dict`: `{"session": (kind, id), "call": {...}}`; raises ValueError("doctype") or
-/// ValueError("not_xml: ...").
+/// `parse_request(body: bytes, max_size) -> dict`: `{"session": (kind, id), "call": {...}}`; raises `DoctypeError`,
+/// `RequestTooLarge` or `RequestError`.
 #[pyfunction(name = "parse_request")]
-pub fn parse_request_py<'py>(py: Python<'py>, body: &[u8]) -> PyResult<Bound<'py, PyDict>> {
-    let r = parse_request(body).map_err(|e| match e {
-        arrow2xmla::ParseError::Doctype => PyValueError::new_err("doctype"),
-        arrow2xmla::ParseError::NotXml(m) => PyValueError::new_err(format!("not_xml: {m}")),
-        other => PyValueError::new_err(format!("not_xml: {other}")),
+#[pyo3(signature = (body, max_size=arrow2xmla::DEFAULT_MAX_REQUEST))]
+pub fn parse_request_py<'py>(py: Python<'py>, body: &[u8], max_size: usize) -> PyResult<Bound<'py, PyDict>> {
+    let r = parse_request_limited(body, max_size).map_err(|e| match e {
+        arrow2xmla::ParseError::Doctype => crate::DoctypeError::new_err("a DOCTYPE is not accepted"),
+        arrow2xmla::ParseError::TooLarge { .. } => crate::RequestTooLarge::new_err(e.to_string()),
+        other => crate::RequestError::new_err(other.to_string()),
     })?;
     let out = PyDict::new(py);
     let (kind, id) = match r.session {
@@ -376,7 +331,14 @@ pub fn parse_request_py<'py>(py: Python<'py>, body: &[u8]) -> PyResult<Bound<'py
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cellset_xml, m)?)?;
-    m.add_function(wrap_pyfunction!(cellset_xml_chunks, m)?)?;
+    #[cfg(feature = "request")]
+    m.add("DEFAULT_MAX_REQUEST", arrow2xmla::DEFAULT_MAX_REQUEST)?;
+    m.add("XmlaError", m.py().get_type::<XmlaError>())?;
+    m.add("CellsetError", m.py().get_type::<CellsetError>())?;
+    m.add("UnsupportedTypeError", m.py().get_type::<UnsupportedTypeError>())?;
+    m.add("RequestError", m.py().get_type::<RequestError>())?;
+    m.add("DoctypeError", m.py().get_type::<DoctypeError>())?;
+    m.add("RequestTooLarge", m.py().get_type::<RequestTooLarge>())?;
     #[cfg(feature = "request")]
     m.add_function(wrap_pyfunction!(request_py::parse_request_py, m)?)?;
     Ok(())

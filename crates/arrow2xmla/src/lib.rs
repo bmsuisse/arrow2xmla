@@ -2,6 +2,8 @@
 //! PivotTable reads, and a parser for its requests. It knows nothing of any engine or product: callers fill the model
 //! (`model`) from their own data and write it, from Rust or through a binding.
 
+#![warn(missing_docs)]
+
 mod array;
 mod cellset;
 mod display;
@@ -13,22 +15,22 @@ mod request;
 
 pub use array::{Array, Validity, Values};
 pub use cellset::WriteOptions;
-pub use display::{display_infos, DRILLED_DOWN, SAME_PARENT};
-pub use esc::{escape_into, quote_attr_into};
-pub use float::write_f64;
 pub use model::*;
 #[cfg(feature = "request")]
-pub use request::{parse_request, Call, ParseError, Request, Session};
+pub use request::{parse_request, parse_request_limited, Call, ParseError, Request, Session, DEFAULT_MAX_REQUEST};
 
 /// The XMLA namespace.
 pub const XA: &str = "urn:schemas-microsoft-com:xml-analysis";
 
+/// Why a cellset was not written.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
+    /// The sink failed.
     Io(std::io::Error),
     /// A column or array type that is not written.
     Unsupported(String),
+    /// A cellset that is not valid (shapes that do not match, bad arrays).
     Invalid(String),
 }
 
@@ -53,8 +55,49 @@ impl From<std::io::Error> for Error {
 mod tests {
     use super::*;
 
+    #[test]
+    fn axis_rules() {
+        let mut cs = Cellset::new("C");
+        cs.columns.push(Column::new(Array::new(Values::F64(&[1.0])), "0"));
+        assert!(String::from_utf8(cs.to_vec().unwrap()).unwrap().contains("<Cell CellOrdinal=\"0\">"), "no axes: one cell");
+        let mut two = Cellset::new("C");
+        two.columns.push(Column::new(Array::new(Values::F64(&[1.0, 2.0])), "0"));
+        assert!(two.validate().is_err(), "no axes: two cells");
+        let axis = || Axis::tuples(Tuples::new(vec![Member::new("[H]", "[H].[L]", 1)], vec![vec![0]]));
+        let mut three = Cellset::new("C");
+        three.axes = vec![axis(), axis(), axis()];
+        three.columns.push(Column::new(Array::new(Values::F64(&[1.0])), "0"));
+        assert!(three.validate().unwrap_err().to_string().contains("at most two axes"));
+    }
+
+    #[test]
+    fn the_core_refuses_a_negative_level_and_a_member_property_twice() {
+        let mut cs = Cellset::new("C");
+        cs.slicer.push(Member::new("[H]", "[H].[L]", -1));
+        assert!(cs.validate().unwrap_err().to_string().contains("negative"));
+        let mut cs = Cellset::new("C");
+        let mut axis = Axis::tuples(Tuples::default());
+        axis.properties = vec![MemberProp::MemberCaption, MemberProp::MemberCaption];
+        cs.axes.push(axis);
+        assert!(cs.validate().unwrap_err().to_string().contains("twice"));
+    }
+
+    #[test]
+    fn a_cell_property_twice_is_refused() {
+        let mut cs = Cellset::new("C");
+        cs.cell_properties = vec![CellProp::Value, CellProp::Value];
+        assert!(cs.validate().is_err());
+    }
+
+    #[cfg(feature = "request")]
+    #[test]
+    fn request_size_limit() {
+        assert_eq!(parse_request_limited(b"<a/>", 3), Err(ParseError::TooLarge { limit: 3 }));
+        assert!(parse_request_limited(b"<a/>", 4).is_ok());
+    }
+
     fn member(h: &str) -> Member {
-        Member { hierarchy: h.into(), level_name: format!("{h}.[L]"), level_number: 1, parent_unique_name: format!("{h}.[All]"), member_type: 1, ..Member::default() }
+        Member { hierarchy: h.into(), level_name: format!("{h}.[L]"), level_number: 1, parent_unique_name: format!("{h}.[All]"), member_type: MemberType::Regular, ..Member::default() }
     }
 
     /// A text array as Arrow lays it out: one data buffer and `n + 1` offsets.

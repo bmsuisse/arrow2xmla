@@ -1,7 +1,7 @@
 //! Parsing of an XMLA request (a SOAP envelope holding a `Discover` or an `Execute`). No DOCTYPE is ever accepted (no
 //! entity expansion), the nesting and the number of elements are bounded, and what a strict parser refuses is refused
 //! (a second root, text outside the root, an undeclared prefix, characters XML forbids). UTF-8 and UTF-16 with a BOM.
-//! The size of a body is for the caller to limit.
+//! A body longer than a limit (`DEFAULT_MAX_REQUEST`, or the caller's) is refused before it is read.
 
 use quick_xml::events::Event;
 use quick_xml::XmlVersion;
@@ -14,14 +14,22 @@ use crate::XA;
 const SOAP: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 const MAX_DEPTH: usize = 64;
 /// Elements one request may have: a request is a few dozen, a statement with its filters a few thousand. The body's
-/// size is the caller's to limit; this keeps a body of nothing but tiny elements from costing many times its size.
+/// size is limited too; this keeps a body of nothing but tiny elements from costing many times its size.
 const MAX_ELEMENTS: usize = 100_000;
 
+/// Why a request was not accepted.
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ParseError {
+    /// The request has a DOCTYPE (entities: a billion laughs).
     Doctype,
+    /// The request is not XML, or not an XMLA request this parser accepts.
     NotXml(String),
+    /// The request is longer than the limit given.
+    TooLarge {
+        /// The limit, in bytes.
+        limit: usize,
+    },
 }
 
 impl std::fmt::Display for ParseError {
@@ -29,6 +37,7 @@ impl std::fmt::Display for ParseError {
         match self {
             ParseError::Doctype => write!(f, "DOCTYPE is not accepted"),
             ParseError::NotXml(e) => write!(f, "the request is not XML: {e}"),
+            ParseError::TooLarge { limit } => write!(f, "the request is longer than {limit} bytes"),
         }
     }
 }
@@ -49,23 +58,37 @@ pub enum Session {
     End(Option<String>),
 }
 
+/// What the request asks for.
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Call {
+    /// A `Discover`: a request for a rowset of metadata.
     Discover {
+        /// `RequestType`, e.g. `MDSCHEMA_CUBES`.
         request_type: String,
         /// Name -> values (`<NAME>v</NAME>` or `<NAME><Value>a</Value><Value>b</Value></NAME>`), in order.
         restrictions: Vec<(String, Vec<String>)>,
+        /// `PropertyList` entries.
         properties: Vec<(String, String)>,
     },
-    Execute { statement: String, properties: Vec<(String, String)> },
+    /// An `Execute`: an MDX statement.
+    Execute {
+        /// The `Statement` text.
+        statement: String,
+        /// `PropertyList` entries.
+        properties: Vec<(String, String)>,
+    },
     /// A body with neither.
     Other,
 }
 
+/// A parsed XMLA request.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Request {
+    /// What the SOAP header says about the session.
     pub session: Session,
+    /// The first `Discover` or `Execute`.
     pub call: Call,
 }
 
@@ -268,6 +291,17 @@ fn properties(call: &El) -> Vec<(String, String)> {
 /// Parses one request. The envelope's elements are matched by namespace, as the protocol says, whatever prefix the
 /// client uses.
 pub fn parse_request(body: &[u8]) -> Result<Request, ParseError> {
+    parse_request_limited(body, DEFAULT_MAX_REQUEST)
+}
+
+/// The longest request `parse_request` reads (4 MiB: a real one is a few KB).
+pub const DEFAULT_MAX_REQUEST: usize = 4 << 20;
+
+/// `parse_request` for a body of at most `max_size` bytes; a longer one is `ParseError::TooLarge` without being read.
+pub fn parse_request_limited(body: &[u8], max_size: usize) -> Result<Request, ParseError> {
+    if body.len() > max_size {
+        return Err(ParseError::TooLarge { limit: max_size });
+    }
     let root = dom(body)?;
     let session = match root.child(SOAP, "Header") {
         None => Session::None,

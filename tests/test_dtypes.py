@@ -14,6 +14,7 @@ import pytest
 import reference as ref
 
 import arrow2xmla
+import compat
 
 H = "[T].[F]"
 CUBE = SimpleNamespace(name="C")
@@ -53,7 +54,7 @@ def reference(keys: pa.Array, columns: list[tuple[pa.Array, str]]) -> str:
 
 def check(keys: pa.Array, columns: list[tuple[pa.Array, str]]) -> str:
     """Same bytes as the reference, and well-formed XML. Returns the answer."""
-    got = arrow2xmla.cellset_xml(spec(keys, columns)).decode()
+    got = compat.cellset_xml(spec(keys, columns)).decode()
     assert got == reference(keys, columns)
     ET.fromstring(got)
     return got
@@ -179,37 +180,37 @@ UNSUPPORTED = {
 @pytest.mark.parametrize("name", UNSUPPORTED)
 def test_unsupported_types_are_refused_as_columns(name: str) -> None:
     with pytest.raises(ValueError):
-        arrow2xmla.cellset_xml(spec(pa.array(["a", "b", "c"]), [(UNSUPPORTED[name], "0")]))
+        compat.cellset_xml(spec(pa.array(["a", "b", "c"]), [(UNSUPPORTED[name], "0")]))
 
 
 @pytest.mark.parametrize("name", UNSUPPORTED)
 def test_unsupported_types_are_refused_as_keys(name: str) -> None:
     with pytest.raises(ValueError):
-        arrow2xmla.cellset_xml(spec(UNSUPPORTED[name], [(pa.array([1.0, 2.0, 3.0]), "0")]))
+        compat.cellset_xml(spec(UNSUPPORTED[name], [(pa.array([1.0, 2.0, 3.0]), "0")]))
 
 
 def test_numeric_keys_are_refused() -> None:
     with pytest.raises(ValueError, match="text"):
-        arrow2xmla.cellset_xml(spec(pa.array([1, 2, 3]), [(pa.array([1.0, 2.0, 3.0]), "0")]))
+        compat.cellset_xml(spec(pa.array([1, 2, 3]), [(pa.array([1.0, 2.0, 3.0]), "0")]))
 
 
 def test_not_an_arrow_object_is_refused() -> None:
-    with pytest.raises(ValueError, match="Arrow"):
-        arrow2xmla.cellset_xml(spec(["a", "b"], [([1.0, 2.0], "0")]))
+    with pytest.raises(TypeError, match="Arrow"):
+        compat.cellset_xml(spec(["a", "b"], [([1.0, 2.0], "0")]))
 
 
 def test_columns_of_different_lengths_are_refused() -> None:
     with pytest.raises(ValueError, match="length"):
-        arrow2xmla.cellset_xml(spec(pa.array(["a", "b"]), [(pa.array([1.0, 2.0]), "0"), (pa.array([1.0]), "0")]))
+        compat.cellset_xml(spec(pa.array(["a", "b"]), [(pa.array([1.0, 2.0]), "0"), (pa.array([1.0]), "0")]))
 
 
 def test_unknown_properties_are_refused() -> None:
     with pytest.raises(ValueError, match="BOGUS"):
-        arrow2xmla.cellset_xml(spec(pa.array(["a"]), [(pa.array([1.0]), "0")], cell_properties=["BOGUS"]))
+        compat.cellset_xml(spec(pa.array(["a"]), [(pa.array([1.0]), "0")], cell_properties=["BOGUS"]))
     s = spec(pa.array(["a"]), [(pa.array([1.0]), "0")])
     s["axes"][0]["properties"] = ["BOGUS"]
     with pytest.raises(ValueError, match="BOGUS"):
-        arrow2xmla.cellset_xml(s)
+        compat.cellset_xml(s)
 
 
 # ---- chunked arrays, no columns, many threads -------------------------------------------------------------------
@@ -220,18 +221,18 @@ def test_chunked_arrays_are_combined() -> None:
     keys = pa.chunked_array(chunks)
     col = pa.chunked_array([[float(i) for i in range(a, a + 5)] for a in (0, 5, 10)])
     flat_keys, flat_col = pa.array(sum(chunks, [])), pa.array([float(i) for i in range(15)])
-    assert arrow2xmla.cellset_xml(spec(keys, [(col, "0")])) == arrow2xmla.cellset_xml(spec(flat_keys, [(flat_col, "0")]))
+    assert compat.cellset_xml(spec(keys, [(col, "0")])) == compat.cellset_xml(spec(flat_keys, [(flat_col, "0")]))
 
 
 def test_a_cellset_with_no_columns_has_no_cells() -> None:
-    out = arrow2xmla.cellset_xml(spec(pa.array(["a", "b"]), [])).decode()
+    out = compat.cellset_xml(spec(pa.array(["a", "b"]), [])).decode()
     assert "<Cell " not in out
     ET.fromstring(out)
 
 
 def test_cell_properties_without_a_value() -> None:
     s = spec(pa.array(["a", "b", "c"]), [(pa.array([1.0, None, 3.0]), "0"), (pa.array(["x", None, "z"]), "@")], cell_properties=["FORMAT_STRING", "LANGUAGE"])
-    out = arrow2xmla.cellset_xml(s).decode()
+    out = compat.cellset_xml(s).decode()
     assert out.count("<Cell ") == 4 and "<Value" not in out
     ET.fromstring(out)
 
@@ -239,9 +240,9 @@ def test_cell_properties_without_a_value() -> None:
 def test_calls_from_many_threads_agree() -> None:
     n = 40_000
     s = spec(pa.array([f"k{i} & <{i}> ]" for i in range(n)]), [(pa.array([i * 0.37 for i in range(n)]), "0"), (pa.array(range(n)), "0")])
-    want = arrow2xmla.cellset_xml(s, threads=1)
+    want = compat.cellset_xml(s, threads=1)
     with ThreadPoolExecutor(8) as pool:
-        results = list(pool.map(lambda t: arrow2xmla.cellset_xml(s, threads=t), itertools.islice(itertools.cycle([0, 1, 2, 4]), 16)))
+        results = list(pool.map(lambda t: compat.cellset_xml(s, threads=t), itertools.islice(itertools.cycle([0, 1, 2, 4]), 16)))
     assert all(r == want for r in results)
 
 
@@ -254,7 +255,7 @@ ILLEGAL = ["\x00", "\x01", "\x08", "\x0b", "\x0c", "\x0e", "\x1f", "￾", "￿"]
 @pytest.mark.parametrize("typ", STRING_TYPES, ids=str)
 def test_characters_xml_forbids_never_reach_the_answer(bad: str, typ: pa.DataType) -> None:
     vals = [f"a{bad}b", bad, f"{bad}{bad}", "ok", f"x]{bad}&"]
-    out = arrow2xmla.cellset_xml(
+    out = compat.cellset_xml(
         {
             "cube": f"cube{bad}",
             "axes": [{"properties": ["MEMBER_CAPTION"], "level": {"template": {**md(SAMPLE), "hierarchy": f"[T{bad}]"}, "keys": pa.array(vals, typ)}}],
@@ -267,7 +268,7 @@ def test_characters_xml_forbids_never_reach_the_answer(bad: str, typ: pa.DataTyp
 
 
 def test_legal_whitespace_controls_survive_a_parse() -> None:
-    out = arrow2xmla.cellset_xml(spec(pa.array(["a\tb\nc\rd"]), [(pa.array(["a\tb\nc\rd"]), "@")]))
+    out = compat.cellset_xml(spec(pa.array(["a\tb\nc\rd"]), [(pa.array(["a\tb\nc\rd"]), "@")]))
     root = ET.fromstring(out)
     assert root.find(f".//{{{M}}}Cell/{{{M}}}Value").text == "a\tb\nc\rd"  # the carriage return is kept
     assert root.find(f".//{{{M}}}Member/{{{M}}}Caption").text == "a\tb\nc\rd"
@@ -279,7 +280,7 @@ def test_hierarchy_names_with_quotes_and_markup_keep_the_header_well_formed(name
     s["axes"][0]["level"]["template"]["hierarchy"] = name
     s["axes"][0]["properties"] = ["MEMBER_CAPTION"]
     s["slicer"] = [{**md(SAMPLE), "hierarchy": name}]
-    out = arrow2xmla.cellset_xml(s)
+    out = compat.cellset_xml(s)
     root = ET.fromstring(out)
     infos = [h.get("name") for h in root.iter(f"{{{M}}}HierarchyInfo")]
     assert infos and all(i == name.replace("\n", " ").replace("\t", " ") or i == name for i in infos)

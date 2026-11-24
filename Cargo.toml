@@ -5,6 +5,7 @@ members = ["crates/arrow2xmla", "crates/arrow2xmla-py"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 license = "MIT"
 
 [profile.release]

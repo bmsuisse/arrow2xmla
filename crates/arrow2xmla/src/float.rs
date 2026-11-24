@@ -3,6 +3,7 @@
 //! clients of an existing XMLA server already get, so a switch to this crate changes no byte. The digits come from
 //! `zmij` (shortest, nearest, ties to even); the common range needs no change, the rest is laid out here.
 
+/// Appends `v` as an `xsd:double` (Python's repr digits; `NaN`, `INF`, `-INF`).
 pub fn write_f64(out: &mut Vec<u8>, v: f64) {
     // the lexical forms of xsd:double (Python's `nan` and `inf` are not)
     if v.is_nan() {

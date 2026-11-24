@@ -11,6 +11,7 @@ import pyarrow as pa
 import pytest
 
 import arrow2xmla
+import compat
 
 H = "[T].[F]"
 MEMBER = dict(hierarchy=H, level_name=f"{H}.[L]", level_number=1)
@@ -34,23 +35,23 @@ def values_of(out: bytes) -> list[tuple[str, str]]:
 
 def test_integers_get_the_xsd_type_that_holds_them() -> None:
     vals = [0, -(2**31), 2**31 - 1, 2**31, -(2**31) - 1, 2**63 - 1]
-    got = values_of(arrow2xmla.cellset_xml(one_axis(pa.array([str(v) for v in vals]), [(pa.array(vals, pa.int64()), "0")])))
+    got = values_of(compat.cellset_xml(one_axis(pa.array([str(v) for v in vals]), [(pa.array(vals, pa.int64()), "0")])))
     assert [t for t, _ in got] == ["xsd:int", "xsd:int", "xsd:int", "xsd:long", "xsd:long", "xsd:long"]
-    got = values_of(arrow2xmla.cellset_xml(one_axis(pa.array(["a", "b"]), [(pa.array([2**63, 2**64 - 1], pa.uint64()), "0")])))
+    got = values_of(compat.cellset_xml(one_axis(pa.array(["a", "b"]), [(pa.array([2**63, 2**64 - 1], pa.uint64()), "0")])))
     assert got == [("xsd:unsignedLong", "9223372036854775808"), ("xsd:unsignedLong", "18446744073709551615")]
-    got = values_of(arrow2xmla.cellset_xml(one_axis(pa.array(["a", "b"]), [(pa.array([2**31, 5], pa.uint32()), "0")])))
+    got = values_of(compat.cellset_xml(one_axis(pa.array(["a", "b"]), [(pa.array([2**31, 5], pa.uint32()), "0")])))
     assert [t for t, _ in got] == ["xsd:long", "xsd:int"]
 
 
 def test_nan_and_infinity_use_the_xsd_double_forms() -> None:
     vals = [float("nan"), float("inf"), float("-inf")]
-    got = values_of(arrow2xmla.cellset_xml(one_axis(pa.array(["a", "b", "c"]), [(pa.array(vals), "0")])))
+    got = values_of(compat.cellset_xml(one_axis(pa.array(["a", "b", "c"]), [(pa.array(vals), "0")])))
     assert [v for _, v in got] == ["NaN", "INF", "-INF"]
 
 
 def test_half_floats_are_widened() -> None:
     vals = [1.0, 0.5, -2.0, 65504.0, 6.103515625e-05, 5.960464477539063e-08, float("inf"), None]
-    got = values_of(arrow2xmla.cellset_xml(one_axis(pa.array([str(i) for i in range(8)]), [(pa.array(vals, pa.float16()), "0")])))
+    got = values_of(compat.cellset_xml(one_axis(pa.array([str(i) for i in range(8)]), [(pa.array(vals, pa.float16()), "0")])))
     assert [v for _, v in got] == ["1.0", "0.5", "-2.0", "65504.0", "6.103515625e-05", "5.960464477539063e-08", "INF"]
 
 
@@ -67,9 +68,9 @@ def string_array(data: bytes, offsets: list[int]) -> pa.Array:
 def test_text_that_is_not_utf8_is_refused(data: bytes) -> None:
     arr = string_array(data, [0, len(data)])
     with pytest.raises(ValueError, match="UTF-8"):
-        arrow2xmla.cellset_xml(one_axis(arr, [(pa.array([1.0]), "0")]))
+        compat.cellset_xml(one_axis(arr, [(pa.array([1.0]), "0")]))
     with pytest.raises(ValueError, match="UTF-8"):
-        arrow2xmla.cellset_xml(one_axis(pa.array(["a"]), [(arr, "@")]))
+        compat.cellset_xml(one_axis(pa.array(["a"]), [(arr, "@")]))
 
 
 def test_a_string_view_outside_its_buffer_is_refused() -> None:
@@ -78,7 +79,7 @@ def test_a_string_view_outside_its_buffer_is_refused() -> None:
     views = struct.pack("<I4sII", 50, b"abcd", 0, 1000)  # 50 bytes at offset 1000 of a 3-byte buffer
     keys = pa.Array.from_buffers(pa.string_view(), 1, [None, pa.py_buffer(views), pa.py_buffer(b"abc")])
     with pytest.raises(ValueError, match="view"):
-        arrow2xmla.cellset_xml(one_axis(keys, [(pa.array([1.0]), "0")]))
+        compat.cellset_xml(one_axis(keys, [(pa.array([1.0]), "0")]))
 
 
 # ---- the axes must list the cells the columns hold -------------------------------------------------------------------
@@ -86,60 +87,62 @@ def test_a_string_view_outside_its_buffer_is_refused() -> None:
 
 def test_orphan_cells_are_refused() -> None:
     with pytest.raises(ValueError, match="axes list"):
-        arrow2xmla.cellset_xml(one_axis(pa.array(["a", "b"]), [(pa.array([1, 2, 3, 4, 5]), "0")]))
+        compat.cellset_xml(one_axis(pa.array(["a", "b"]), [(pa.array([1, 2, 3, 4, 5]), "0")]))
     with pytest.raises(ValueError, match="axes list"):  # two columns but only one axis of two members
-        arrow2xmla.cellset_xml(one_axis(pa.array(["a", "b"]), [(pa.array([1, 2]), "0"), (pa.array([3, 4]), "0")]))
+        compat.cellset_xml(one_axis(pa.array(["a", "b"]), [(pa.array([1, 2]), "0"), (pa.array([3, 4]), "0")]))
     spec = {"cube": "C", "axes": [{"tuples": [[MEMBER]]}, {"level": {"template": MEMBER, "keys": pa.array(["a", "b", "c"])}}], "columns": [(pa.array([1, 2]), "0")]}
     with pytest.raises(ValueError, match="axes list"):
-        arrow2xmla.cellset_xml(spec)
+        compat.cellset_xml(spec)
 
 
 def test_nothing_is_written_when_the_input_is_wrong() -> None:
     """An error comes before the first byte, so a caller that streams never sends half an answer."""
     n = 40_000
     bad = one_axis(pa.array([f"k{i}" for i in range(n)]), [(pa.array(range(n)), "0"), (pa.array(range(n - 1)), "0")])
-    with pytest.raises(ValueError):
-        arrow2xmla.cellset_xml_chunks(bad)
+    with pytest.raises(arrow2xmla.CellsetError):
+        compat.cellset_xml(bad)
 
 
 @pytest.mark.parametrize("axes", [{}, "axes", 3, None])
 def test_axes_must_be_a_list(axes: object) -> None:
     with pytest.raises(TypeError):
-        arrow2xmla.cellset_xml({"cube": "C", "axes": axes, "columns": []})
+        compat.cellset_xml({"cube": "C", "axes": axes, "columns": []})
 
 
 def test_spec_checks() -> None:
     base = one_axis(pa.array(["a"]), [(pa.array([1.0]), "0")])
     for bad_spec, match in [
         ({**base, "cell_properties": ["VALUE", "VALUE"]}, "twice"),
-        ({**base, "language": True}, "bool"),
+        ({**base, "language": True}, "LCID"),
         ({**base, "columns": [(pa.array([1.0]), "0", 1)]}, "pair"),
-        ({**base, "columns": {}}, "list"),
+        ({**base, "columns": {}}, "pairs"),
+        ({**base, "cell_properties": ["BACK_COLOR"]}, "unknown cell property"),
+        ({**base, "cell_properties": "VALUE"}, "sequence"),
     ]:
         with pytest.raises((ValueError, TypeError), match=match):
-            arrow2xmla.cellset_xml(bad_spec)
+            compat.cellset_xml(bad_spec)
     s = one_axis(pa.array(["a"]), [(pa.array([1.0]), "0")])
     s["axes"][0]["level"]["template"] = {**MEMBER, "level_number": -1}
     with pytest.raises(ValueError, match="negative"):
-        arrow2xmla.cellset_xml(s)
+        compat.cellset_xml(s)
     s["axes"][0]["level"]["template"] = {**MEMBER, "bogus": 1}
     with pytest.raises(ValueError, match="bogus"):
-        arrow2xmla.cellset_xml(s)
+        compat.cellset_xml(s)
     s["axes"][0]["level"]["template"] = MEMBER
     s["axes"][0]["properties"] = ["MEMBER_CAPTION", "MEMBER_CAPTION"]
     with pytest.raises(ValueError, match="twice"):
-        arrow2xmla.cellset_xml(s)
+        compat.cellset_xml(s)
 
 
 def test_a_non_array_says_what_it_got() -> None:
-    with pytest.raises(ValueError, match="not a list"):
-        arrow2xmla.cellset_xml(one_axis(["a"], [(pa.array([1.0]), "0")]))
+    with pytest.raises(TypeError, match="Arrow array"):
+        compat.cellset_xml(one_axis(["a"], [(pa.array([1.0]), "0")]))
 
 
 def test_threads_is_bounded() -> None:
     n = 30_000
     s = one_axis(pa.array([f"k{i}" for i in range(n)]), [(pa.array(range(n)), "0")])
-    assert arrow2xmla.cellset_xml(s, threads=1_000_000) == arrow2xmla.cellset_xml(s, threads=1)
+    assert compat.cellset_xml(s, threads=1_000_000) == compat.cellset_xml(s, threads=1)
 
 
 # ---- hostile C data interface structs: an error, never a crash ---------------------------------------------------
@@ -147,6 +150,8 @@ def test_threads_is_bounded() -> None:
 FFI = textwrap.dedent(
     """
     import ctypes, sys
+    sys.path.insert(0, "tests")
+    import compat
     import pyarrow as pa
     import arrow2xmla
 
@@ -210,7 +215,7 @@ FFI = textwrap.dedent(
     for kind, arr in kinds.items():
         for name, mutate in cases.items():
             try:
-                arrow2xmla.cellset_xml(spec(Hostile(arr, mutate)))
+                compat.cellset_xml(spec(Hostile(arr, mutate)))
                 print("accepted", kind, name)
                 ok = False
             except ValueError:
@@ -259,18 +264,18 @@ def test_the_parser_refuses_what_a_strict_one_does(bad: bytes) -> None:
 
 def test_a_prefixed_attribute_is_not_the_plain_one() -> None:
     head = f'<x:Session xmlns:x="{XA}" x:SessionId="abc"/>'
-    assert arrow2xmla.parse_request(req(head=head))["session"] == ("none", None)
+    assert arrow2xmla.parse_request(req(head=head)).session == arrow2xmla.Session(arrow2xmla.SessionKind.NONE)
 
 
 def test_an_empty_session_id_is_no_session() -> None:
     head = f'<Session xmlns="{XA}" SessionId=""/>'
-    assert arrow2xmla.parse_request(req(head=head))["session"] == ("none", None)
+    assert arrow2xmla.parse_request(req(head=head)).session == arrow2xmla.Session(arrow2xmla.SessionKind.NONE)
 
 
 def test_the_first_discover_or_execute_of_any_body_is_the_call() -> None:
     two = f'<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body/><s:Body>{EXEC}</s:Body></s:Envelope>'.encode()
-    assert arrow2xmla.parse_request(two)["call"]["kind"] == "execute"
+    assert isinstance(arrow2xmla.parse_request(two).call, arrow2xmla.Execute)
 
 
 def test_whitespace_around_the_root_is_fine() -> None:
-    assert arrow2xmla.parse_request(b"\n  " + req() + b"\n\n")["call"]["kind"] == "execute"
+    assert isinstance(arrow2xmla.parse_request(b"\n  " + req() + b"\n\n").call, arrow2xmla.Execute)

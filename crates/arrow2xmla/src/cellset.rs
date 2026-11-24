@@ -11,7 +11,7 @@ use crate::array::{Array, Values};
 use crate::display::{children_bits, display_infos, DRILLED_DOWN};
 use crate::esc::{escape_attr_into, escape_bytes_into, escape_into, needs_escape, quote_attr_into};
 use crate::float::{f16_to_f64, write_f64};
-use crate::model::{Axis, AxisSource, Cellset, Member, MemberProp};
+use crate::model::{Axis, AxisSource, CellProp, Cellset, Member, MemberProp};
 use crate::{Error, XA};
 
 const FLUSH_AT: usize = 1 << 20; // bytes of small parts held before they go out as a chunk
@@ -172,7 +172,7 @@ fn prop_value(m: &Member, p: MemberProp, out: &mut Vec<u8>) {
         MemberProp::ChildrenCardinality => lit(out, itoa::Buffer::new().format(m.children_cardinality)),
         MemberProp::ParentLevel => out.push(b'0'),
         MemberProp::ParentCount => out.push(if m.parent_unique_name.is_empty() { b'0' } else { b'1' }),
-        MemberProp::MemberType => lit(out, itoa::Buffer::new().format(m.member_type)),
+        MemberProp::MemberType => lit(out, itoa::Buffer::new().format(m.member_type.code())),
     }
 }
 
@@ -327,9 +327,7 @@ fn write_axis(w: &mut Writer<'_>, n: usize, axis: &Axis<'_>) -> Result<(), Error
     match &axis.source {
         AxisSource::Tuples(t) => {
             let width = t.tuples.first().map_or(0, Vec::len);
-            if t.tuples.iter().any(|x| x.len() != width || x.iter().any(|&k| k as usize >= t.members.len())) {
-                return Err(Error::Invalid("tuples of different widths, or a member index out of range".into()));
-            }
+            debug_assert!(t.tuples.iter().all(|x| x.len() == width && x.iter().all(|&k| (k as usize) < t.members.len())), "validate() checks the tuples");
             let infos = display_infos(&t.members, &t.tuples);
             // each member's XML once, however many tuples hold it
             let mut parts: Vec<Option<(Vec<u8>, Vec<u8>)>> = vec![None; t.members.len()];
@@ -511,7 +509,7 @@ fn write_cell(b: &mut Vec<u8>, ord: u64, col: &Col<'_>, r: usize, with_value: bo
 }
 
 fn write_cells(w: &mut Writer<'_>, cs: &Cellset<'_>) -> Result<(), Error> {
-    let with_value = cs.cell_properties.iter().any(|p| p.name == "VALUE");
+    let with_value = cs.cell_properties.contains(&CellProp::Value);
     let ncols = cs.columns.len();
     if ncols == 0 {
         return Ok(());
@@ -523,18 +521,18 @@ fn write_cells(w: &mut Writer<'_>, cs: &Cellset<'_>) -> Result<(), Error> {
         .map(|c| {
             let mut tail = Vec::new();
             for p in &cs.cell_properties {
-                let value = match p.name.as_str() {
-                    "FORMAT_STRING" => {
+                let value = match p {
+                    CellProp::FormatString => {
                         let mut e = Vec::new();
                         escape_into(&mut e, &c.format);
                         e
                     }
-                    "LANGUAGE" => cs.language.to_string().into_bytes(),
+                    CellProp::Language => cs.language.to_string().into_bytes(),
                     _ => continue,
                 };
-                lit(&mut tail, &format!("<{}>", p.element));
+                lit(&mut tail, &format!("<{}>", p.element()));
                 tail.extend_from_slice(&value);
-                lit(&mut tail, &format!("</{}>", p.element));
+                lit(&mut tail, &format!("</{}>", p.element()));
             }
             Ok(Col { array: c.values, tail })
         })
@@ -561,16 +559,43 @@ impl Cellset<'_> {
     /// Everything that can be wrong with the input, before the first byte is written (a caller that streams the
     /// answer must not have sent half of it when an error comes back).
     pub fn validate(&self) -> Result<(), Error> {
+        if self.axes.len() > 2 {
+            return Err(Error::Invalid(format!("a cellset has at most two axes (columns, rows), not {}", self.axes.len())));
+        }
+        for (i, p) in self.cell_properties.iter().enumerate() {
+            if self.cell_properties[..i].contains(p) {
+                return Err(Error::Invalid(format!("cell property {} twice", p.name())));
+            }
+        }
+        let level_ok = |m: &Member| {
+            if m.level_number < 0 {
+                Err(Error::Invalid("level_number must not be negative".into()))
+            } else {
+                Ok(())
+            }
+        };
+        self.slicer.iter().try_for_each(level_ok)?;
         for axis in &self.axes {
+            for (i, p) in axis.properties.iter().enumerate() {
+                if axis.properties[..i].contains(p) {
+                    return Err(Error::Invalid(format!("member property {} twice", p.name())));
+                }
+            }
             match &axis.source {
                 AxisSource::Level(l) => {
+                    level_ok(&l.template)?;
+                    l.all.as_ref().map_or(Ok(()), level_ok)?;
                     l.keys.check()?;
                     if !l.keys.is_text() {
                         return Err(Error::Unsupported("a level's keys must be a text array".into()));
                     }
                 }
                 AxisSource::Tuples(t) => {
+                    t.members.iter().try_for_each(level_ok)?;
                     let width = t.tuples.first().map_or(0, Vec::len);
+                    if !t.tuples.is_empty() && width == 0 {
+                        return Err(Error::Invalid("a tuple needs at least one member".into()));
+                    }
                     if t.tuples.iter().any(|x| x.len() != width || x.iter().any(|&k| k as usize >= t.members.len())) {
                         return Err(Error::Invalid("tuples of different widths, or a member index out of range".into()));
                     }
@@ -591,16 +616,16 @@ impl Cellset<'_> {
         // a cell's ordinal is `row * columns + column`: the axes must list exactly those cells
         let lens: Vec<usize> = self.axes.iter().map(axis_len).collect();
         let ok = match lens.as_slice() {
-            [] => rows == 0,
+            [] => rows * ncols <= 1, // `SELECT FROM cube WHERE ...`: one cell, no axes
             [n] => *n == rows * ncols,
             [cols, rws] => *cols == ncols && *rws == rows,
-            more => more.iter().product::<usize>() == rows * ncols,
+            _ => false,
         };
         if ok {
             Ok(())
         } else {
             Err(Error::Invalid(format!(
-                "the axes list {lens:?} members but there are {rows} rows of {ncols} columns of cells (one axis: rows * columns; two: columns, then rows)"
+                "the axes list {lens:?} members but there are {rows} rows of {ncols} columns of cells (no axis: at most one cell; one axis: rows * columns; two: columns, then rows)"
             )))
         }
     }
@@ -636,8 +661,8 @@ impl Cellset<'_> {
         }
         lit(b, "</AxisInfo></AxesInfo><CellInfo>");
         for p in &self.cell_properties {
-            lit(b, &format!("<{} name=\"{}\"", p.element, p.name));
-            if let Some(t) = &p.xsd_type {
+            lit(b, &format!("<{} name=\"{}\"", p.element(), p.name()));
+            if let Some(t) = p.xsd_type() {
                 lit(b, &format!(" type=\"{t}\""));
             }
             lit(b, "/>");
@@ -670,6 +695,7 @@ impl Cellset<'_> {
         self.write_chunks(WriteOptions::default(), &mut |chunk| Ok(out.write_all(&chunk)?))
     }
 
+    /// The cellset as bytes.
     pub fn to_vec(&self) -> Result<Vec<u8>, Error> {
         let mut v = Vec::new();
         self.write_to(&mut v)?;

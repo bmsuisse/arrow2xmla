@@ -9,7 +9,9 @@ resolution-markers = [
 [[package]]
 name = "arrow2xmla"
 source = { editable = "." }
-dependencies = [
+
+[package.optional-dependencies]
+pyarrow = [
     { name = "pyarrow", version = "25.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pyarrow", version = "26.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
@@ -17,16 +19,20 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "maturin" },
+    { name = "pyarrow", version = "25.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "pyarrow", version = "26.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pytest" },
     { name = "pytest-benchmark" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pyarrow", specifier = ">=15" }]
+requires-dist = [{ name = "pyarrow", marker = "extra == 'pyarrow'", specifier = ">=15" }]
+provides-extras = ["pyarrow"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "maturin", specifier = ">=1.7" },
+    { name = "pyarrow", specifier = ">=15" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-benchmark", specifier = ">=4" },
 ]

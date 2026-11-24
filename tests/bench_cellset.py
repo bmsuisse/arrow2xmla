@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pyarrow as pa
 import reference as ref
 
-from arrow2xmla import cellset_xml
+from compat import cellset_xml
 
 H = "[Customer].[Name]"
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 60_000

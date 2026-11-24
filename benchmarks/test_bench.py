@@ -15,6 +15,7 @@ import pyarrow as pa
 import pytest
 
 import arrow2xmla
+import compat
 
 H = "[Customer].[Name]"
 ALL = dict(hierarchy=H, unique_name=f"{H}.[All]", caption="All", level_name=f"{H}.[(All)]", level_number=0, children_cardinality=1000, member_type=2)
@@ -59,14 +60,9 @@ CASES = {
 @pytest.mark.parametrize("case", CASES)
 def test_cellset(benchmark, case: str) -> None:
     spec = CASES[case]
-    out = benchmark(arrow2xmla.cellset_xml, spec)
+    out = benchmark(compat.to_cellset(spec).to_xml)
     benchmark.extra_info["answer_MB"] = round(len(out) / 1e6, 1)
 
-
-@pytest.mark.parametrize("case", ["60k rows x 3 mixed", "490k rows x 3 mixed"])
-def test_cellset_chunks(benchmark, case: str) -> None:
-    chunks = benchmark(arrow2xmla.cellset_xml_chunks, CASES[case])
-    benchmark.extra_info["chunks"] = len(chunks)
 
 
 def _nested(n_outer: int = 4000, inner: int = 4):
@@ -97,14 +93,14 @@ def test_nested_tuples(benchmark) -> None:
     """Two hierarchies nested on rows (explicit tuples, DisplayInfo worked out), 4 000 x 5 tuples, as member dicts."""
     members, tuples = _nested()
     spec = {"cube": "C", "axes": [{"properties": ["MEMBER_CAPTION"], "tuples": [[members[k] for k in t] for t in tuples]}], "columns": [(floats(len(tuples), 4), "0")]}
-    benchmark(arrow2xmla.cellset_xml, spec)
+    benchmark(compat.to_cellset(spec).to_xml)
 
 
 def test_nested_tuples_indexed(benchmark) -> None:
     """The same, the members listed once and each tuple naming them by index."""
     members, tuples = _nested()
     spec = {"cube": "C", "axes": [{"properties": ["MEMBER_CAPTION"], "members": members, "tuples": tuples}], "columns": [(floats(len(tuples), 4), "0")]}
-    benchmark(arrow2xmla.cellset_xml, spec)
+    benchmark(compat.to_cellset(spec).to_xml)
 
 
 FIXTURES = sorted(glob.glob(os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "excel", "*request*.xml")))

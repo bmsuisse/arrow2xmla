@@ -10,47 +10,80 @@ use crate::Error;
 pub enum Values<'a> {
     /// Half-precision floats as their bits.
     F16(&'a [u16]),
+    /// 64-bit floats.
     F64(&'a [f64]),
+    /// 32-bit floats.
     F32(&'a [f32]),
+    /// Signed 64-bit integers.
     I64(&'a [i64]),
+    /// Signed 32-bit integers.
     I32(&'a [i32]),
+    /// Signed 16-bit integers.
     I16(&'a [i16]),
+    /// Signed 8-bit integers.
     I8(&'a [i8]),
+    /// Unsigned 64-bit integers.
     U64(&'a [u64]),
+    /// Unsigned 32-bit integers.
     U32(&'a [u32]),
+    /// Unsigned 16-bit integers.
     U16(&'a [u16]),
+    /// Unsigned 8-bit integers.
     U8(&'a [u8]),
     /// Text with `i32` offsets (`offsets.len() == len + 1`).
-    Utf8 { offsets: &'a [i32], data: &'a [u8] },
+    Utf8 {
+        /// `len + 1` offsets into `data`.
+        offsets: &'a [i32],
+        /// The text, back to back.
+        data: &'a [u8],
+    },
     /// Text with `i64` offsets.
-    LargeUtf8 { offsets: &'a [i64], data: &'a [u8] },
+    LargeUtf8 {
+        /// `len + 1` offsets into `data`.
+        offsets: &'a [i64],
+        /// The text, back to back.
+        data: &'a [u8],
+    },
     /// Text as 16-byte views (inline up to 12 bytes, else a buffer index and offset) over `buffers`.
-    Utf8View { views: &'a [[u8; 16]], buffers: &'a [&'a [u8]] },
+    Utf8View {
+        /// One 16-byte view per value.
+        views: &'a [[u8; 16]],
+        /// The data buffers the views point into.
+        buffers: &'a [&'a [u8]],
+    },
 }
 
 /// Which rows have a value: bit `i + offset` of `bits` (LSB first). Absent: all rows do.
 #[derive(Clone, Copy, Debug)]
 pub struct Validity<'a> {
+    /// The bitmap.
     pub bits: &'a [u8],
+    /// Bits to skip.
     pub offset: usize,
 }
 
+/// A column of values with an optional validity bitmap; borrows its buffers.
 #[derive(Clone, Copy, Debug)]
 pub struct Array<'a> {
+    /// The values.
     pub values: Values<'a>,
+    /// Which of them are not null.
     pub validity: Option<Validity<'a>>,
 }
 
 impl<'a> Array<'a> {
+    /// An array without nulls.
     pub fn new(values: Values<'a>) -> Self {
         Self { values, validity: None }
     }
 
+    /// The same with a validity bitmap (bit `i + offset` is row `i`).
     pub fn with_validity(mut self, bits: &'a [u8], offset: usize) -> Self {
         self.validity = Some(Validity { bits, offset });
         self
     }
 
+    /// The number of rows.
     pub fn len(&self) -> usize {
         match self.values {
             Values::F16(v) => v.len(),
@@ -70,10 +103,12 @@ impl<'a> Array<'a> {
         }
     }
 
+    /// No rows.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Whether row `i` has a value.
     #[inline]
     pub fn is_valid(&self, i: usize) -> bool {
         match self.validity {
@@ -85,6 +120,7 @@ impl<'a> Array<'a> {
         }
     }
 
+    /// Whether the values are text.
     pub fn is_text(&self) -> bool {
         matches!(self.values, Values::Utf8 { .. } | Values::LargeUtf8 { .. } | Values::Utf8View { .. })
     }

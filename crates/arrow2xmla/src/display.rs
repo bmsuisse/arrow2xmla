@@ -2,7 +2,9 @@
 
 use crate::model::Member;
 
+/// `DISPLAY_INFO` flag: the member is drilled down (its children follow).
 pub const DRILLED_DOWN: u32 = 0x10000;
+/// `DISPLAY_INFO` flag: the member has the parent of the one before.
 pub const SAME_PARENT: u32 = 0x20000;
 
 /// The children count (low 16 bits) of a member, as `DISPLAY_INFO` holds it.

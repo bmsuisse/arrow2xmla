@@ -3,6 +3,7 @@ name = "arrow2xmla"
 description = "Write XMLA (MDDataset) cellsets straight from columnar (Arrow) data, and parse XMLA requests. Pure Rust, no engine or product dependencies."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository = "https://github.com/bmsuisse/arrow2xmla"
 readme = "../../README.md"

@@ -10,7 +10,21 @@ import pytest
 
 from xml.parsers import expat
 
-from arrow2xmla import parse_request
+import arrow2xmla
+from arrow2xmla import Discover, Execute, SessionKind, XmlaError as _X  # noqa: F401
+
+
+def parse_request(body: bytes) -> dict:
+    """The typed request in the plain shape the reference reader produces."""
+    r = arrow2xmla.parse_request(body)
+    c = r.call
+    if isinstance(c, Discover):
+        call = {"kind": "discover", "request_type": c.request_type, "restrictions": [(k, list(v)) for k, v in c.restrictions], "properties": list(c.properties)}
+    elif isinstance(c, Execute):
+        call = {"kind": "execute", "statement": c.statement, "properties": list(c.properties)}
+    else:
+        call = {"kind": "other"}
+    return {"session": (r.session.kind.value, r.session.id), "call": call}
 
 XA = "urn:schemas-microsoft-com:xml-analysis"
 NS = {"s": "http://schemas.xmlsoap.org/soap/envelope/", "x": XA}
@@ -109,7 +123,7 @@ def test_doctype_refused_by_both() -> None:
     body = b'<?xml version="1.0"?><!DOCTYPE a [<!ENTITY e "x">]><a>&e;</a>'
     with pytest.raises(XmlaError):
         _no_doctype(body)
-    with pytest.raises(ValueError, match="doctype"):
+    with pytest.raises(arrow2xmla.DoctypeError):
         parse_request(body)
 
 
@@ -118,5 +132,5 @@ def test_not_xml_refused_by_both(body: bytes) -> None:
     with pytest.raises((XmlaError, ET.ParseError)):
         _no_doctype(body)
         ET.fromstring(body)
-    with pytest.raises(ValueError, match="not_xml"):
+    with pytest.raises(arrow2xmla.RequestError):
         parse_request(body)
