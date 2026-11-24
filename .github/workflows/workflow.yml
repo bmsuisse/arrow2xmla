@@ -88,6 +88,29 @@ jobs:
           python -m pip install --no-index --find-links dist arrow2xmla
           python -m pytest -q
 
+  olap4j:
+    # an independent client (olap4j's XMLA driver, Java) and the XMLA schema read our answers from a mock endpoint
+    needs: wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-ubuntu-latest-x86_64
+          path: dist
+      - run: |
+          python -m pip install pytest pyarrow lxml
+          python -m pip install --no-index --find-links dist arrow2xmla
+          tests/olap4j/build.sh .olap4j-build
+          python -m pytest tests/e2e -q
+
   sdist:
     needs: test
     runs-on: ubuntu-latest

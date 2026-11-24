@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 .benchmarks/
 .schema-cache/
+.olap4j-build/

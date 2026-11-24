@@ -195,6 +195,8 @@ The output is byte-identical to a plain Python implementation, which is what the
 - **End to end**: a mock XMLA endpoint over real HTTP (`tests/e2e`) replays the recorded Excel requests; a mock client reads
   each answer the way a pivot client does (strict XML, axes as tuples, cells by ordinal, typed by `xsi:type`) and checks the
   grid against the data, including nulls, escaping, sessions, faults on bad requests and 200 000 rows from concurrent callers.
+- **Independent client**: olap4j's XMLA driver (Java) connects to that endpoint, runs MDX and reads the pivot back: axes, members,
+  typed cells and nulls. The cellset is also validated against Microsoft's `mddataset` schema.
 
 Real Excel for Windows is the one client that cannot be run in CI: the request fixtures are recordings of it, and the mock
 client stands in for it.

@@ -56,6 +56,55 @@ def envelope(body: str, session: str | None) -> bytes:
     return f'<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:soap="{SOAP}">{head}<soap:Body>{body}</soap:Body></soap:Envelope>'.encode()
 
 
+def rowset(rows: list[dict]) -> str:
+    """A Discover answer: `<root>` of `<row>`s (the rowset schema block is left out; clients read the rows by name)."""
+    from xml.sax.saxutils import escape
+
+    body = "".join("<row>" + "".join(f"<{k}>{escape(str(v))}</{k}>" for k, v in r.items() if v is not None) + "</row>" for r in rows)
+    return f'<root xmlns="{ROWSET}" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="{XSI}">{body}</root>'
+
+
+def metadata(customers: list[str | None], cube: str = "Sales", catalog: str = "Demo") -> dict[str, list[dict]]:
+    """The schema rowsets of the mock's one cube: a Customer dimension (All + names) and a Measures dimension."""
+    base = {"CATALOG_NAME": catalog, "SCHEMA_NAME": None, "CUBE_NAME": cube}
+    cust, meas = "[Customer]", "[Measures]"
+    def member(hier: str, level: str, number: int, name: str, caption: str, ordinal: int, kind: int, parent: str, children: int) -> dict:
+        unique = f"{hier}.[{name}]" if kind != 2 else f"{hier}.[All]"
+        return {
+            **base, "DIMENSION_UNIQUE_NAME": hier.split(".")[0], "HIERARCHY_UNIQUE_NAME": hier, "LEVEL_UNIQUE_NAME": level, "LEVEL_NUMBER": number,
+            "MEMBER_ORDINAL": ordinal, "MEMBER_NAME": caption, "MEMBER_UNIQUE_NAME": unique, "MEMBER_TYPE": kind, "MEMBER_CAPTION": caption,
+            "CHILDREN_CARDINALITY": children, "PARENT_LEVEL": max(number - 1, 0), "PARENT_UNIQUE_NAME": parent, "PARENT_COUNT": int(number > 0),
+        }  # fmt: skip
+
+    members = [member(meas, f"{meas}.[MeasuresLevel]", 0, "Revenue", "Revenue", 0, 3, "", 0), member(meas, f"{meas}.[MeasuresLevel]", 0, "Orders", "Orders", 1, 3, "", 0)]
+    members.append(member(f"{cust}.[Name]", f"{cust}.[Name].[(All)]", 0, "All", "All", 0, 2, "", len(customers)))
+    for i, name in enumerate(n for n in customers if n is not None):
+        members.append(member(f"{cust}.[Name]", f"{cust}.[Name].[Name]", 1, name, name, i + 1, 1, f"{cust}.[Name].[All]", 0))
+    return {
+        "MDSCHEMA_MEMBERS": members,
+        "DISCOVER_DATASOURCES": [{"DataSourceName": "Mock", "DataSourceDescription": "arrow2xmla mock", "DataSourceInfo": "Provider=arrow2xmla", "URL": "http://localhost/xmla", "ProviderName": "arrow2xmla", "ProviderType": "MDP", "AuthenticationMode": "Unauthenticated"}],
+        "DBSCHEMA_CATALOGS": [{"CATALOG_NAME": catalog}],
+        "MDSCHEMA_CUBES": [{**base, "CUBE_TYPE": "CUBE", "DESCRIPTION": "mock"}],
+        "MDSCHEMA_DIMENSIONS": [
+            {**base, "DIMENSION_NAME": "Customer", "DIMENSION_UNIQUE_NAME": cust, "DIMENSION_CAPTION": "Customer", "DIMENSION_ORDINAL": 1, "DIMENSION_TYPE": 3, "DEFAULT_HIERARCHY": f"{cust}.[Name]", "IS_VIRTUAL": "false", "IS_READWRITE": "false"},
+            {**base, "DIMENSION_NAME": "Measures", "DIMENSION_UNIQUE_NAME": meas, "DIMENSION_CAPTION": "Measures", "DIMENSION_ORDINAL": 0, "DIMENSION_TYPE": 2, "DEFAULT_HIERARCHY": meas, "IS_VIRTUAL": "false", "IS_READWRITE": "false"},
+        ],
+        "MDSCHEMA_HIERARCHIES": [
+            {**base, "DIMENSION_UNIQUE_NAME": cust, "HIERARCHY_NAME": "Name", "HIERARCHY_UNIQUE_NAME": f"{cust}.[Name]", "HIERARCHY_CAPTION": "Name", "DIMENSION_TYPE": 3, "HIERARCHY_CARDINALITY": 100, "DEFAULT_MEMBER": f"{cust}.[All]", "ALL_MEMBER": f"{cust}.[All]", "STRUCTURE": 0, "IS_VIRTUAL": "false", "IS_READWRITE": "false"},
+            {**base, "DIMENSION_UNIQUE_NAME": meas, "HIERARCHY_NAME": "Measures", "HIERARCHY_UNIQUE_NAME": meas, "HIERARCHY_CAPTION": "Measures", "DIMENSION_TYPE": 2, "HIERARCHY_CARDINALITY": 2, "DEFAULT_MEMBER": f"{meas}.[Revenue]", "STRUCTURE": 0, "IS_VIRTUAL": "false", "IS_READWRITE": "false"},
+        ],
+        "MDSCHEMA_LEVELS": [
+            {**base, "DIMENSION_UNIQUE_NAME": cust, "HIERARCHY_UNIQUE_NAME": f"{cust}.[Name]", "LEVEL_NAME": "(All)", "LEVEL_UNIQUE_NAME": f"{cust}.[Name].[(All)]", "LEVEL_CAPTION": "(All)", "LEVEL_NUMBER": 0, "LEVEL_CARDINALITY": 1, "LEVEL_TYPE": 1},
+            {**base, "DIMENSION_UNIQUE_NAME": cust, "HIERARCHY_UNIQUE_NAME": f"{cust}.[Name]", "LEVEL_NAME": "Name", "LEVEL_UNIQUE_NAME": f"{cust}.[Name].[Name]", "LEVEL_CAPTION": "Name", "LEVEL_NUMBER": 1, "LEVEL_CARDINALITY": 100, "LEVEL_TYPE": 0},
+            {**base, "DIMENSION_UNIQUE_NAME": meas, "HIERARCHY_UNIQUE_NAME": meas, "LEVEL_NAME": "MeasuresLevel", "LEVEL_UNIQUE_NAME": f"{meas}.[MeasuresLevel]", "LEVEL_CAPTION": "MeasuresLevel", "LEVEL_NUMBER": 0, "LEVEL_CARDINALITY": 2, "LEVEL_TYPE": 0},
+        ],
+        "MDSCHEMA_MEASURES": [
+            {**base, "MEASURE_NAME": n, "MEASURE_UNIQUE_NAME": f"{meas}.[{n}]", "MEASURE_CAPTION": n, "MEASURE_AGGREGATOR": 1, "DATA_TYPE": 5, "MEASURE_IS_VISIBLE": "true"}
+            for n in ("Revenue", "Orders")
+        ],
+    }
+
+
 def fault(message: str) -> bytes:
     from xml.sax.saxutils import escape
 
@@ -66,7 +115,7 @@ class Server:
     """`with Server(table) as url:` serves XMLA on a free local port."""
 
     def __init__(self, table: Table, threads: int = 0) -> None:
-        self.table, self.threads, self.seen = table, threads, []
+        self.table, self.threads, self.seen, self.meta = table, threads, [], metadata(table.customers.to_pylist())
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -93,7 +142,10 @@ class Server:
         session = {ax.SessionKind.BEGIN: "mock-session"}.get(req.session.kind, req.session.id)
         call = req.call
         if isinstance(call, ax.Discover):
-            return 200, envelope(f'<DiscoverResponse xmlns="{XA}"><return><root xmlns="{ROWSET}"/></return></DiscoverResponse>', session)
+            rows = self.meta.get(call.request_type, [])
+            for name, values in call.restrictions:  # a restriction keeps the rows whose column equals one of its values
+                rows = [r for r in rows if r.get(name) is None or r[name] in values]
+            return 200, envelope(f'<DiscoverResponse xmlns="{XA}"><return>{rowset(rows)}</return></DiscoverResponse>', session)
         if isinstance(call, ax.Execute):
             if not call.statement.strip():  # Excel's empty Execute that opens a session
                 return 200, envelope(f'<ExecuteResponse xmlns="{XA}"><return><root xmlns="{MD}"/></return></ExecuteResponse>', session)

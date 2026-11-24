@@ -95,6 +95,8 @@ Checks that use them:
   (`tests/e2e/schemas.py`). The mirror's copy is lossy and is patched in two places, so this checks the structure and the
   cell ordinals, not the typed values; mutated answers are shown to fail.
 - **Replay and read-back** (`tests/e2e`): the recorded Excel requests against a mock endpoint, answers read like a client.
-- **Not done**: an independent client. The Python `xmla` package targets Python 2 and does not run on a current Python;
-  olap4j (Java) would, and needs a JDK. Mondrian's XMLA tests hold expected request/response pairs (including for older
-  Excel) that could be mined.
+- **An independent client** (`tests/e2e/test_olap4j.py`, optional, needs a JDK): olap4j's XMLA driver (Java, Apache-2.0),
+  written by others, connects to the mock endpoint, runs MDX and reads the cellset: the axes and their members, and every
+  cell with its type (`Double`, `Integer`) and its nulls. `tests/olap4j/build.sh` builds the driver from source (it is not
+  on Maven Central). The Python `xmla` package was tried first: it targets Python 2 and does not run on a current Python.
+- **Not done**: Mondrian's XMLA tests hold expected request/response pairs (including for older Excel) that could be mined.
