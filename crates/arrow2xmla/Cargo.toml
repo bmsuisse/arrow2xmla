@@ -1,0 +1,15 @@
+[package]
+name = "arrow2xmla"
+description = "Write XMLA (MDDataset) cellsets straight from Apache Arrow arrays. Pure Rust, no engine or product dependencies."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arrow-array = "60"
+arrow-schema = "60"
+itoa = "1"
+quick-xml = "0.42"
+
+[dev-dependencies]
+arrow-array = "60"

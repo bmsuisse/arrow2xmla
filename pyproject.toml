@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "arrow2xmla"
+version = "0.1.0"
+description = "Arrow in, XMLA out: a generic, engine-free XMLA cellset writer and request parser (Rust core)."
+requires-python = ">=3.10"
+dependencies = ["pyarrow>=15"]
+
+[dependency-groups]
+dev = ["maturin>=1.7", "pytest>=8", "pytest-benchmark>=4"]
+
+[tool.maturin]
+manifest-path = "crates/arrow2xmla-py/Cargo.toml"
+python-source = "python"
+module-name = "arrow2xmla._native"
