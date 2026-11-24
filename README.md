@@ -192,8 +192,12 @@ The output is byte-identical to a plain Python implementation, which is what the
 - **Hardening**: a data-type matrix, hostile C-interface structs in a subprocess (it must error, never crash), number
   forms at their boundaries, and a strict-parser suite.
 - **Contract**: every name the Python enums know is known to the Rust core.
+- **End to end**: a mock XMLA endpoint over real HTTP (`tests/e2e`) replays the recorded Excel requests; a mock client reads
+  each answer the way a pivot client does (strict XML, axes as tuples, cells by ordinal, typed by `xsi:type`) and checks the
+  grid against the data, including nulls, escaping, sessions, faults on bad requests and 200 000 rows from concurrent callers.
 
-Real Excel for Windows is the one client that cannot be run in CI; the request fixtures are recordings of it.
+Real Excel for Windows is the one client that cannot be run in CI: the request fixtures are recordings of it, and the mock
+client stands in for it.
 
 ## Not built yet
 
