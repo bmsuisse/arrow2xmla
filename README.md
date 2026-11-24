@@ -199,6 +199,8 @@ The output is byte-identical to a plain Python implementation, which is what the
 Real Excel for Windows is the one client that cannot be run in CI: the request fixtures are recordings of it, and the mock
 client stands in for it.
 
+What Excel sends and expects, from the recorded session: [`docs/EXCEL-XMLA.md`](docs/EXCEL-XMLA.md).
+
 ## Not built yet
 
 SOAP envelope and fault writers, the `Discover` rowset writers, an MDX parser, binary XML (`sx`) and Xpress compression,
