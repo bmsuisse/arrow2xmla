@@ -138,11 +138,11 @@ fn close(stack: &mut Vec<El>, root: &mut Option<El>) {
 /// UTF-8 (with or without a BOM) as is; UTF-16 with a BOM is turned into UTF-8 first. Anything else is refused.
 fn utf8(body: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, ParseError> {
     let utf16 = |rest: &[u8], le: bool| -> Result<Vec<u8>, ParseError> {
-        if rest.len() % 2 != 0 {
+        if !rest.len().is_multiple_of(2) {
             return Err(ParseError::NotXml("a UTF-16 body of odd length".into()));
         }
         let units: Vec<u16> =
-            rest.chunks_exact(2).map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) }).collect();
+            rest.as_chunks::<2>().0.iter().map(|c| if le { u16::from_le_bytes(*c) } else { u16::from_be_bytes(*c) }).collect();
         String::from_utf16(&units).map(String::into_bytes).map_err(|_| ParseError::NotXml("invalid UTF-16".into()))
     };
     Ok(if let Some(r) = body.strip_prefix(b"\xFF\xFE") {
@@ -264,17 +264,17 @@ mod tests {
     fn discover_with_values_and_session() {
         let x = format!(
             "{HEAD}<soap:Header><Session xmlns=\"{XA}\" SessionId=\"abc\"/></soap:Header><soap:Body><Discover xmlns=\"{XA}\">\
-<RequestType> MDSCHEMA_CUBES </RequestType><Restrictions><RestrictionList><CATALOG_NAME>OneView</CATALOG_NAME>\
+<RequestType> MDSCHEMA_CUBES </RequestType><Restrictions><RestrictionList><CATALOG_NAME>Demo</CATALOG_NAME>\
 <X><Value>a</Value><Value>b&amp;c</Value></X></RestrictionList></Restrictions>\
-<Properties><PropertyList><Catalog>OneView</Catalog><Empty/></PropertyList></Properties></Discover></soap:Body></soap:Envelope>"
+<Properties><PropertyList><Catalog>Demo</Catalog><Empty/></PropertyList></Properties></Discover></soap:Body></soap:Envelope>"
         );
         let r = parse_request(x.as_bytes()).unwrap();
         assert_eq!(r.session, Session::Use("abc".into()));
         let Call::Discover { request_type, restrictions, properties } = r.call else { panic!() };
         assert_eq!(request_type, "MDSCHEMA_CUBES");
-        assert_eq!(restrictions[0], ("CATALOG_NAME".into(), vec!["OneView".into()]));
+        assert_eq!(restrictions[0], ("CATALOG_NAME".into(), vec!["Demo".into()]));
         assert_eq!(restrictions[1], ("X".into(), vec!["a".into(), "b&c".into()]));
-        assert_eq!(properties, vec![("Catalog".into(), "OneView".into()), ("Empty".into(), String::new())]);
+        assert_eq!(properties, vec![("Catalog".into(), "Demo".into()), ("Empty".into(), String::new())]);
     }
 
     #[test]

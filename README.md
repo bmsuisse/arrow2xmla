@@ -14,6 +14,12 @@ fill a small model (`Cellset`, `Axis`, `Member`, Arrow `Column`s) from their own
 
 Not built yet: the SOAP envelope/fault and rowset (`Discover`) writers, the MDX parser, binary XML (`sx`) and Xpress.
 
+## Install
+
+```
+pip install arrow2xmla
+```
+
 ## Use
 
 ```python
@@ -27,8 +33,9 @@ req = parse_request(body)   # {"session": (kind, id), "call": {"kind": "execute"
 ```
 cargo test                                   # Rust unit tests
 uv sync && uv run maturin develop -r         # build the Python module
-ONEVIEW_PATH=../OneView PYTHONPATH=python ../OneView/.venv/bin/python -m pytest tests/parity   # byte parity
-ONEVIEW_PATH=../OneView PYTHONPATH=python ../OneView/.venv/bin/python tests/bench_cellset.py 60000
+uv run pytest                                # byte parity against the pure-Python reference (tests/reference.py)
+uv run python tests/bench_cellset.py 60000   # Rust against the reference on one big pivot
 ```
 
-The parity tests are the only coupling to OneView: they compare the output with its pure-Python implementation.
+The parity tests hold the Rust output to the plain Python implementation in `tests/reference.py` and the request parser
+to Python's `expat` and `ElementTree`, on real Excel requests (`tests/fixtures/excel`).

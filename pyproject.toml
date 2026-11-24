@@ -4,10 +4,21 @@ build-backend = "maturin"
 
 [project]
 name = "arrow2xmla"
-version = "0.1.0"
+dynamic = ["version"]  # from Cargo.toml: one place for the Rust crates and the wheel
 description = "Arrow in, XMLA out: a generic, engine-free XMLA cellset writer and request parser (Rust core)."
 requires-python = ">=3.10"
+readme = "README.md"
+license = "MIT"
+keywords = ["xmla", "arrow", "excel", "olap", "mdx"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+]
 dependencies = ["pyarrow>=15"]
+
+[project.urls]
+Repository = "https://github.com/bmsuisse/arrow2xmla"
 
 [dependency-groups]
 dev = ["maturin>=1.7", "pytest>=8", "pytest-benchmark>=4"]
@@ -16,3 +27,7 @@ dev = ["maturin>=1.7", "pytest>=8", "pytest-benchmark>=4"]
 manifest-path = "crates/arrow2xmla-py/Cargo.toml"
 python-source = "python"
 module-name = "arrow2xmla._native"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]

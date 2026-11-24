@@ -152,7 +152,10 @@ fn pieces(bytes: &[u8]) -> Vec<Piece> {
     out
 }
 
-fn str_at<'a>(a: &'a ArrayRef) -> Result<Box<dyn Fn(usize) -> Option<&'a str> + 'a>, Error> {
+/// Reads a string array by row, whatever its string type; None for a null.
+type StrAt<'a> = Box<dyn Fn(usize) -> Option<&'a str> + 'a>;
+
+fn str_at<'a>(a: &'a ArrayRef) -> Result<StrAt<'a>, Error> {
     match a.data_type() {
         DataType::Utf8 => {
             let s = a.as_string::<i32>();
@@ -264,7 +267,7 @@ enum Cells<'a> {
     U32(&'a arrow_array::UInt32Array),
     U16(&'a arrow_array::UInt16Array),
     U8(&'a arrow_array::UInt8Array),
-    Str(Box<dyn Fn(usize) -> Option<&'a str> + 'a>),
+    Str(StrAt<'a>),
 }
 
 fn cells_of(a: &ArrayRef) -> Result<Cells<'_>, Error> {

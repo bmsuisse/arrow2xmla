@@ -6,8 +6,9 @@ import pyarrow as pa
 import pytest
 
 from arrow2xmla import cellset_xml
-from backend.xmla import query, service
-from backend.xmla.cube import member_uname
+import reference as query
+import reference as service
+from reference import member_uname
 
 H = "[Customer].[Name]"
 ALL = "All"

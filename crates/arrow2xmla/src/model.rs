@@ -84,7 +84,7 @@ pub struct LevelAxis {
 pub enum AxisSource {
     /// Explicit tuples; `DisplayInfo` (children, drilled down, same parent) is worked out from them.
     Tuples(Vec<Vec<Member>>),
-    Level(LevelAxis),
+    Level(Box<LevelAxis>),
 }
 
 #[derive(Clone, Debug)]

@@ -49,7 +49,7 @@ fn axis(d: &Bound<'_, PyDict>) -> PyResult<Axis> {
         };
         let blank: String = l.get_item("blank_caption")?.map_or(Ok("(blank)".to_string()), |v| v.extract())?;
         let level = LevelAxis { all, template: member(get(&l, "template")?.cast()?)?, keys: array(&get(&l, "keys")?)?, blank_caption: blank };
-        return Ok(Axis { source: AxisSource::Level(level), properties });
+        return Ok(Axis { source: AxisSource::Level(Box::new(level)), properties });
     }
     let tuples = get(d, "tuples")?
         .cast::<PyList>()?

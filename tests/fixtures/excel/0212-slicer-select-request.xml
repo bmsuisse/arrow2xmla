@@ -1,0 +1,16 @@
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Header><Session xmlns="urn:schemas-microsoft-com:xml-analysis" SessionId="f40b05c290644b378bd0192c4a8bb420"/></soap:Header><soap:Body><Execute xmlns="urn:schemas-microsoft-com:xml-analysis"><Command><Statement>with set __XLUniqueNames as { [Trips].[Time of day].&amp;[Night] } &#xD;
+set __XLDrilledUp as &#xD;
+Generate(__XLUniqueNames, &#xD;
+{ IIF([Trips].[Time of day].currentmember.LEVEL_NUMBER &lt;= 2147483647, &#xD;
+	[Trips].[Time of day].currentmember, &#xD;
+	Ancestor([Trips].[Time of day].currentmember, &#xD;
+			[Trips].[Time of day].currentmember.LEVEL_NUMBER - 2147483647)) } ) &#xD;
+member [Measures].__XLPath as &#xD;
+Generate( &#xD;
+	Ascendants([Trips].[Time of day].currentmember), &#xD;
+				[Trips].[Time of day].currentmember.unique_name, &#xD;
+				"__XLPSEP") &#xD;
+select { [Measures].__XLPath } on 0, &#xD;
+__XLDrilledUp on 1 &#xD;
+from [DS_SAMPLES] &#xD;
+cell properties value</Statement></Command><Properties><PropertyList><Catalog>Demo</Catalog><Timeout>0</Timeout><Format>Native</Format><DbpropMsmdFlattened2>false</DbpropMsmdFlattened2><SspropInitAppName>Excel</SspropInitAppName><SafetyOptions>2</SafetyOptions><Dialect>MDX</Dialect><ClientProcessID>3788</ClientProcessID><MdxMissingMemberMode>Error</MdxMissingMemberMode><LocaleIdentifier>1033</LocaleIdentifier><DbpropMsmdMDXCompatibility>1</DbpropMsmdMDXCompatibility></PropertyList></Properties></Execute></soap:Body></soap:Envelope>

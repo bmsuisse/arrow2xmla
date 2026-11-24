@@ -1,5 +1,5 @@
-"""The Rust request parser against the ElementTree/expat code it replaced in OneView (copied above as the reference), on
-every real Excel request recorded in OneView's tests and on edge cases."""
+"""The Rust request parser against Python's expat and ElementTree (the reference below), on real Excel requests
+recorded from a PivotTable session (tests/fixtures/excel) and on edge cases."""
 
 import glob
 import os
@@ -21,7 +21,7 @@ class XmlaError(Exception):
 
 
 def _no_doctype(body: bytes) -> None:
-    """The old OneView check (expat), kept here as the reference the Rust parser is held to."""
+    """A DOCTYPE is refused by the parser itself, whatever the encoding (expat): the reference the Rust parser is held to."""
 
     def refuse(*_: object) -> None:
         raise XmlaError("DOCTYPE is not accepted")
@@ -46,7 +46,7 @@ def _properties(root: ET.Element) -> dict[str, str]:
     lst = root.find("x:Properties/x:PropertyList", NS)
     return {} if lst is None else {c.tag.split("}")[-1]: c.text or "" for c in lst}
 
-FIXTURES = sorted(glob.glob(os.path.join(os.environ["ONEVIEW_PATH"], "tests/unit/xmla_excel/*request*.xml")))
+FIXTURES = sorted(glob.glob(os.path.join(os.path.dirname(__file__), "..", "fixtures", "excel", "*request*.xml")))
 
 EDGE = [
     b'<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><x:Execute xmlns:x="urn:schemas-microsoft-com:xml-analysis"><x:Command><x:Statement><![CDATA[SELECT <1> FROM [C]]]></x:Statement></x:Command><x:Properties><x:PropertyList><x:Format>Native</x:Format></x:PropertyList></x:Properties></x:Execute></s:Body></s:Envelope>',
