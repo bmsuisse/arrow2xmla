@@ -58,22 +58,28 @@ jobs:
         if: ${{ !contains(matrix.target, 'musl') }}
         shell: bash
         run: |
-          python -m pip install pytest pyarrow
+          python -m pip install pytest pyarrow lxml
           python -m pip install --no-index --find-links dist arrow2xmla
-          python -m pytest -q
+          python -m pytest -q -rs
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist
 
-  # one abi3 wheel serves every Python: run it on each
+  # one abi3 wheel serves every Python: run the whole suite (parity, data types, hardening, end to end, schema) on each
+  # supported Python on Linux, macOS and Windows
   python-versions:
     needs: wheels
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - { os: ubuntu-latest, wheel: wheels-ubuntu-latest-x86_64 }
+          - { os: macos-latest, wheel: wheels-macos-latest-aarch64 }
+          - { os: windows-latest, wheel: wheels-windows-latest-x64 }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -81,12 +87,13 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - uses: actions/download-artifact@v4
         with:
-          name: wheels-ubuntu-latest-x86_64
+          name: ${{ matrix.wheel }}
           path: dist
-      - run: |
-          python -m pip install pytest pyarrow
+      - shell: bash
+        run: |
+          python -m pip install pytest pyarrow lxml
           python -m pip install --no-index --find-links dist arrow2xmla
-          python -m pytest -q
+          python -m pytest -q -rs
 
   olap4j:
     # an independent client (olap4j's XMLA driver, Java) and the XMLA schema read our answers from a mock endpoint
@@ -110,6 +117,88 @@ jobs:
           python -m pip install --no-index --find-links dist arrow2xmla
           tests/olap4j/build.sh .olap4j-build
           python -m pytest tests/e2e -q
+
+  # the crate on every OS, in release too (debug assertions are off there), the MSRV, docs and examples
+  rust:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p arrow2xmla --all-features
+      - run: cargo test -p arrow2xmla --all-features --release
+      - run: cargo run -p arrow2xmla --example basic
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - run: cargo test -p arrow2xmla
+
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo doc -p arrow2xmla --no-deps --all-features
+
+  # unsafe-free core, but it reads raw offsets and bit-packed validity: run it on a big-endian machine under QEMU
+  big-endian:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cross --git https://github.com/cross-rs/cross --locked
+      - run: cross test -p arrow2xmla --target s390x-unknown-linux-gnu
+
+  audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # speed and size of the wheel, in the job summary
+  benchmarks:
+    needs: wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-ubuntu-latest-x86_64
+          path: dist
+      - run: |
+          python -m pip install pytest pytest-benchmark pyarrow
+          python -m pip install --no-index --find-links dist arrow2xmla
+          python -m pytest benchmarks --benchmark-only --benchmark-columns=min,mean,max,rounds --benchmark-json=bench.json -q
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, glob, os
+          print("### Benchmarks (ubuntu-latest, Python 3.13)\n\n| case | mean | answer |\n|---|---:|---:|")
+          for b in json.load(open("bench.json"))["benchmarks"]:
+              print(f"| {b['name']} | {b['stats']['mean'] * 1000:.2f} ms | {b['extra_info'].get('answer_MB', '')} MB |")
+          for w in glob.glob("dist/*.whl"):
+              print(f"\nwheel: {os.path.getsize(w) / 1024:.0f} KB")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks
+          path: bench.json
 
   sdist:
     needs: test
