@@ -110,9 +110,26 @@ def test_bad_arguments() -> None:
 
 MEMORY = textwrap.dedent(
     """
-    import resource, sys
+    import sys
     import pyarrow as pa
     import arrow2xmla as ax
+
+    def reset_peak():
+        # Linux counts a child's peak from its parent's memory at fork (the test runner is big), so reset it
+        if sys.platform == "linux":
+            try:
+                with open("/proc/self/clear_refs", "w") as f:
+                    f.write("5")
+            except OSError:
+                print("unsupported"); raise SystemExit(0)
+
+    def peak():
+        if sys.platform == "linux":
+            for line in open("/proc/self/status"):
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) * 1024
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024)
 
     class Null:
         n = 0
@@ -124,22 +141,24 @@ MEMORY = textwrap.dedent(
     ms = [ax.Member("[Measures]", "[Measures].[ML]", 0, f"[Measures].[{c}]", c, member_type=ax.MemberType.MEASURE) for c in "ABC"]
     cs = ax.Cellset("C", [ax.CellValues(pa.array([i / 3 for i in range(n)]), "0.00"), ax.CellValues(pa.array(range(n)), "0"), ax.CellValues(pa.array([i * 2 for i in range(n)]), "0")],
                     ax.TupleAxis.from_tuples([[x] for x in ms]), ax.LevelAxis(m, pa.array([f"customer number {i} & co" for i in range(n)])))
-    base = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    reset_peak()
+    base = peak()
     if sys.argv[1] == "stream":
         sink = Null(); cs.write_to(sink); size = sink.n
     else:
         size = len(cs.to_xml())
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    scale = 1 if sys.platform == "darwin" else 1024
-    print(size // 1_000_000, (peak - base) * scale // 1_000_000)
+    print(size // 1_000_000, (peak() - base) // 1_000_000)
     """
 )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="peak memory is read with /proc or resource: neither is on Windows")
 def test_streaming_holds_a_fraction_of_the_answer_in_memory() -> None:
     def run(mode: str) -> tuple[int, int]:
         out = subprocess.run([sys.executable, "-c", MEMORY, mode], capture_output=True, text=True, timeout=300)
         assert out.returncode == 0, out.stderr
+        if out.stdout.strip() == "unsupported":
+            pytest.skip("this system cannot reset its peak memory counter")
         size, grown = map(int, out.stdout.split())
         return size, grown
 
