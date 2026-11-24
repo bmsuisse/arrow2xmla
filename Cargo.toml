@@ -10,3 +10,5 @@ license = "MIT"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+strip = true
+opt-level = "s"

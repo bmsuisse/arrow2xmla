@@ -12,38 +12,42 @@ pub fn children_bits(m: &Member) -> u32 {
 
 /// A member is drilled down when the next tuple that does not repeat it (same outer members) holds one of its
 /// children; it has the same parent as the previous one likewise. "Next" and "previous" skip the tuples that repeat
-/// the member (the inner members vary under it).
-pub fn display_infos(axis: &[Vec<Member>]) -> Vec<Vec<u32>> {
-    let n = axis.len();
-    let width = axis.first().map_or(0, Vec::len);
-    let mut infos: Vec<Vec<u32>> = axis.iter().map(|t| t.iter().map(children_bits).collect()).collect();
+/// the member (the inner members vary under it). `tuples` hold indices into `members`, all of one width; the result
+/// is flat, `tuples.len() * width` values, a tuple after another.
+pub fn display_infos(members: &[Member], tuples: &[Vec<u32>]) -> Vec<u32> {
+    let n = tuples.len();
+    let width = tuples.first().map_or(0, Vec::len);
+    let m = |i: usize, j: usize| &members[tuples[i][j] as usize];
+    let mut infos: Vec<u32> = tuples.iter().flat_map(|t| t.iter().map(|&k| children_bits(&members[k as usize]))).collect();
     // same[i]: how many leading members tuple i shares with tuple i - 1
     let mut same = vec![0usize; n];
     for i in 1..n {
         let mut k = 0;
-        while k < width && axis[i - 1][k].unique_name == axis[i][k].unique_name {
+        while k < width && (tuples[i - 1][k] == tuples[i][k] || m(i - 1, k).unique_name == m(i, k).unique_name) {
             k += 1;
         }
         same[i] = k;
     }
+    let mut start = vec![0usize; n];
+    let mut end = vec![n; n];
     for j in 0..width {
-        let mut start = vec![0usize; n];
+        // start[i]: the first tuple of the run that repeats members 0..j; end[i]: the first tuple after that run
         for i in 1..n {
             start[i] = if same[i] > j { start[i - 1] } else { i };
         }
-        let mut end = vec![n; n];
+        end[n.saturating_sub(1)..].fill(n);
         for i in (0..n.saturating_sub(1)).rev() {
             end[i] = if same[i + 1] > j { end[i + 1] } else { i + 1 };
         }
         for i in 0..n {
-            let m = &axis[i][j];
+            let me = m(i, j);
             let e = end[i];
-            if e < n && same[e] >= j && axis[e][j].parent_unique_name == m.unique_name {
-                infos[i][j] |= DRILLED_DOWN;
+            if e < n && same[e] >= j && m(e, j).parent_unique_name == me.unique_name {
+                infos[i * width + j] |= DRILLED_DOWN;
             }
             let b = start[i];
-            if b > 0 && !m.parent_unique_name.is_empty() && same[b] >= j && axis[b - 1][j].parent_unique_name == m.parent_unique_name {
-                infos[i][j] |= SAME_PARENT;
+            if b > 0 && !me.parent_unique_name.is_empty() && same[b] >= j && m(b - 1, j).parent_unique_name == me.parent_unique_name {
+                infos[i * width + j] |= SAME_PARENT;
             }
         }
     }

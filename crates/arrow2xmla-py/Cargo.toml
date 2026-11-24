@@ -9,6 +9,9 @@ name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-arrow2xmla = { path = "../arrow2xmla" }
-arrow = { version = "60", default-features = false, features = ["pyarrow"] }
+arrow2xmla = { path = "../arrow2xmla", default-features = false }
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
+
+[features]
+default = ["request"]
+request = ["arrow2xmla/request"]

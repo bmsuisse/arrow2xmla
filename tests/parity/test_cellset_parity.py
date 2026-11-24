@@ -163,3 +163,24 @@ def test_large_floats_repr() -> None:
     py = expected(CUBE, [[(value_member(H, "k0"),)]], python_cells([(col, "0")]), [], [()], ("VALUE", "FORMAT_STRING"), {0: light})
     spec = {"cube": CUBE.name, "axes": [{"level": {"template": member_dict(value_member(H, "x")), "keys": pa.array(keys)}}], "columns": [(col, "0")]}
     check(spec, py)
+
+
+def test_indexed_tuples_are_the_same_as_member_tuples() -> None:
+    h1, h2 = hier("A"), hier("B")
+    mem = [all_member(h1), value_member(h1, "x"), all_member(h2), value_member(h2, "y"), value_member(h2, "z")]
+    idx = [[0, 2], [0, 3], [0, 4], [1, 2], [1, 3]]
+    cols = [(pa.array([1.0, 2.0, 3.0, 4.0, 5.0]), "0")]
+    by_member = {"cube": CUBE.name, "axes": [{"tuples": [[member_dict(mem[k]) for k in t] for t in idx]}], "columns": cols}
+    by_index = {"cube": CUBE.name, "axes": [{"members": [member_dict(m) for m in mem], "tuples": idx}], "columns": cols}
+    py = expected(CUBE, [[tuple(mem[k] for k in t) for t in idx]], python_cells(cols), [], [()], ("VALUE", "FORMAT_STRING"))
+    check(by_member, py)
+    check(by_index, py)
+
+
+def test_threads_do_not_change_a_byte() -> None:
+    n = 50_000
+    keys = pa.array([f"k{i} & <{i}> ]" for i in range(n)])
+    spec = {"cube": "C", "axes": [{"properties": ["MEMBER_CAPTION"], "level": {"template": member_dict(value_member(H, "x")), "keys": keys}}], "columns": [(pa.array([i * 0.37 for i in range(n)]), "0"), (pa.array(range(n)), "0")]}
+    one = cellset_xml(spec, threads=1)
+    assert one == cellset_xml(spec, threads=3) == cellset_xml(spec, threads=0)
+    assert b"".join(__import__("arrow2xmla").cellset_xml_chunks(spec)) == one

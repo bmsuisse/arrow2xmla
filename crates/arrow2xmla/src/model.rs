@@ -1,7 +1,7 @@
 //! The data model: what a cellset is made of. No engine, no product names: a caller fills these in from wherever its
 //! members and numbers come from.
 
-use arrow_array::ArrayRef;
+use crate::array::Array;
 
 /// One member of a hierarchy (a value of a field, its All member, a measure).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -70,26 +70,55 @@ impl MemberProp {
 /// Nothing is built per value: the text of each member is written from the column. The unique name of a value is
 /// `<hierarchy>.&[<key>]` (`]` doubled), its caption the key, a null one has the key "" and `blank_caption`.
 #[derive(Clone, Debug)]
-pub struct LevelAxis {
+pub struct LevelAxis<'a> {
     pub all: Option<Member>,
     /// A value's member without its names: `hierarchy`, `level_name`, `level_number`, `parent_unique_name`,
     /// `children_cardinality` and `member_type` are used; `unique_name` and `caption` are made per value.
     pub template: Member,
-    /// A `Utf8`, `LargeUtf8` or `Utf8View` array.
-    pub keys: ArrayRef,
+    /// A text array (`Utf8`, `LargeUtf8` or `Utf8View`).
+    pub keys: Array<'a>,
     pub blank_caption: String,
 }
 
-#[derive(Clone, Debug)]
-pub enum AxisSource {
-    /// Explicit tuples; `DisplayInfo` (children, drilled down, same parent) is worked out from them.
-    Tuples(Vec<Vec<Member>>),
-    Level(Box<LevelAxis>),
+/// Explicit tuples: the distinct members once, each tuple as indices into them (all tuples of one width).
+/// `DisplayInfo` (children, drilled down, same parent) is worked out from them.
+#[derive(Clone, Debug, Default)]
+pub struct Tuples {
+    pub members: Vec<Member>,
+    pub tuples: Vec<Vec<u32>>,
+}
+
+impl Tuples {
+    /// From tuples of members: equal members are stored once.
+    pub fn from_members(tuples: Vec<Vec<Member>>) -> Self {
+        let mut index: std::collections::HashMap<Member, u32> = std::collections::HashMap::new();
+        let mut members = vec![];
+        let tuples = tuples
+            .into_iter()
+            .map(|t| {
+                t.into_iter()
+                    .map(|m| {
+                        *index.entry(m.clone()).or_insert_with(|| {
+                            members.push(m);
+                            (members.len() - 1) as u32
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        Self { members, tuples }
+    }
 }
 
 #[derive(Clone, Debug)]
-pub struct Axis {
-    pub source: AxisSource,
+pub enum AxisSource<'a> {
+    Tuples(Tuples),
+    Level(Box<LevelAxis<'a>>),
+}
+
+#[derive(Clone, Debug)]
+pub struct Axis<'a> {
+    pub source: AxisSource<'a>,
     pub properties: Vec<MemberProp>,
 }
 
@@ -126,25 +155,25 @@ impl CellProperty {
 
 /// One measure's values, one per row, and its number format. Nulls are cells with no value (not written).
 #[derive(Clone, Debug)]
-pub struct Column {
-    /// Float16/32/64, any signed or unsigned integer, or `Utf8`/`LargeUtf8`/`Utf8View`.
-    pub values: ArrayRef,
+pub struct Column<'a> {
+    /// Float32/64, any signed or unsigned integer, or text.
+    pub values: Array<'a>,
     pub format: String,
 }
 
 /// A whole cellset (the answer to an MDX `Execute`). A cell's ordinal is `row * columns + column`.
 #[derive(Clone, Debug)]
-pub struct Cellset {
+pub struct Cellset<'a> {
     pub cube_name: String,
-    pub axes: Vec<Axis>,
+    pub axes: Vec<Axis<'a>>,
     pub slicer: Vec<Member>,
     pub cell_properties: Vec<CellProperty>,
-    pub columns: Vec<Column>,
+    pub columns: Vec<Column<'a>>,
     /// The LCID written in `Language` (1033: English).
     pub language: u32,
 }
 
-impl Cellset {
+impl Cellset<'_> {
     pub fn new(cube_name: impl Into<String>) -> Self {
         Self {
             cube_name: cube_name.into(),

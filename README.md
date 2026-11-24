@@ -6,11 +6,12 @@ fill a small model (`Cellset`, `Axis`, `Member`, Arrow `Column`s) from their own
 
 | Piece | Where |
 |---|---|
-| Cellset writer (MDDataset), streamed in ~1 MB chunks, straight from Arrow arrays | `crates/arrow2xmla/src/cellset.rs` |
+| Cellset writer (MDDataset): rows rendered in chunks on several threads, straight from columnar data | `crates/arrow2xmla/src/cellset.rs` |
+| Zero-copy column views (`Array`, `Values`): floats, integers, text (`Utf8`, `LargeUtf8`, `Utf8View`), nulls, offsets; no Arrow library needed (an optional `arrow` feature converts `arrow_array::ArrayRef`) | `array.rs` |
 | `DISPLAY_INFO` of tuples (children, drilled down, same parent) | `display.rs` |
-| Request parser (SOAP: Discover / Execute / session), no DOCTYPE, bounded depth, no Python `xml.etree` or `expat` | `request.rs` |
-| Python-`repr` floats, `saxutils`-exact escaping (byte parity with an existing Python server) | `float.rs`, `esc.rs` |
-| Python binding (`pyarrow` arrays, no copy) | `crates/arrow2xmla-py` |
+| Request parser (SOAP: Discover / Execute / session): no DOCTYPE, bounded depth, UTF-8 and UTF-16 (feature `request`) | `request.rs` |
+| Python-`repr` floats (via `zmij`), `saxutils`-exact escaping; characters XML 1.0 forbids become U+FFFD | `float.rs`, `esc.rs` |
+| Python binding: reads any Arrow array through the PyCapsule interface (`__arrow_c_array__`), no Arrow dependency | `crates/arrow2xmla-py` |
 
 Not built yet: the SOAP envelope/fault and rowset (`Discover`) writers, the MDX parser, binary XML (`sx`) and Xpress.
 
@@ -24,18 +25,37 @@ pip install arrow2xmla
 
 ```python
 from arrow2xmla import cellset_xml, parse_request
-xml = cellset_xml({"cube": "Sales", "axes": [...], "columns": [(pa_array, "#,##0")]})
+xml = cellset_xml(
+    {
+        "cube": "Sales",
+        "axes": [{"properties": ["MEMBER_CAPTION"], "level": {"template": member, "keys": pa_text_array}}],
+        "columns": [(pa_array, "#,##0")],   # a cell's ordinal is row * len(columns) + column
+    },
+    threads=0,   # 0: the machine's cores (at most 8); 1: the calling thread
+)
 req = parse_request(body)   # {"session": (kind, id), "call": {"kind": "execute", "statement": ...}}
 ```
+
+Explicit tuples can be given as member dicts, or (faster, 4-5x on big axes) as `{"members": [...], "tuples": [[0, 3], ...]}`.
+
+Columns may be any float or integer type, or text; nulls are cells with no value. Other types (bool, dates,
+decimals, dictionaries, ...) are refused with a `ValueError`; cast them first.
 
 ## Develop
 
 ```
 cargo test                                   # Rust unit tests
 uv sync && uv run maturin develop -r         # build the Python module
-uv run pytest                                # byte parity against the pure-Python reference (tests/reference.py)
-uv run python tests/bench_cellset.py 60000   # Rust against the reference on one big pivot
+uv run pytest                                # byte parity against the pure-Python reference (tests/reference.py), and the data-type matrix
+uv run pytest benchmarks --benchmark-only    # speed (pytest-benchmark); add --benchmark-save=NAME / --benchmark-compare
+uv run python benchmarks/size.py             # size of the module and the wheel
 ```
 
 The parity tests hold the Rust output to the plain Python implementation in `tests/reference.py` and the request parser
-to Python's `expat` and `ElementTree`, on real Excel requests (`tests/fixtures/excel`).
+to Python's `expat` and `ElementTree`, on real Excel requests (`tests/fixtures/excel`). The reference passes characters XML
+forbids through; this crate replaces them (so Excel's parser accepts the answer): that is the one deliberate difference.
+
+## Speed and size
+
+490 000 rows, 3 measures (296 MB of XML): about 20 ms on 8 threads, 65 ms on one (a pure-Python writer: 1 100 ms). The
+module is about 500 KB, the wheel 250 KB; there are no Arrow crates in it. Per-version numbers: `benchmarks/`.

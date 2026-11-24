@@ -1,36 +1,111 @@
-//! The cellset (`urn:schemas-microsoft-com:xml-analysis:mddataset`) written from the model, streamed in chunks.
+//! The cellset (`urn:schemas-microsoft-com:xml-analysis:mddataset`) written from the model, in chunks. The two big
+//! parts, the members of a level axis and the cells, are cut into ranges of rows that threads render at once and the
+//! writer hands on in order, so a large answer scales with the cores and is never held whole by this crate.
 
 use std::io::Write;
+use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::*;
-use arrow_array::{Array, ArrayRef};
-use arrow_schema::DataType;
-
+use crate::array::{Array, Values};
 use crate::display::{children_bits, display_infos, DRILLED_DOWN};
-use crate::esc::{escape_into, quote_attr_into};
+use crate::esc::{escape_attr_into, escape_bytes_into, escape_into, needs_escape, quote_attr_into};
 use crate::float::write_f64;
 use crate::model::{Axis, AxisSource, Cellset, Member, MemberProp};
 use crate::{Error, XA};
 
-const FLUSH_AT: usize = 1 << 20; // bytes held before they go to the writer
+const FLUSH_AT: usize = 1 << 20; // bytes of small parts held before they go out as a chunk
+const PAR_MIN_ROWS: usize = 16 * 1024; // below this a single thread is faster than the hand-over
+const LEVEL_CHUNK_ROWS: usize = 2048; // rows of a level axis per chunk: about 1 MB
+const CELL_CHUNK_CELLS: usize = 12 * 1024; // cells per chunk: about 1 MB
+const SAME_PARENT_TEXT: &[u8] = b"131072"; // SAME_PARENT
 
-/// The writer: bytes collect and go out in chunks of about 1 MB.
-struct Sink<'a, W: Write> {
-    buf: Vec<u8>,
-    out: &'a mut W,
+/// How a cellset is written.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WriteOptions {
+    /// Threads that render at once; 0 picks the machine's (at most 8). 1 keeps everything on the calling thread.
+    pub threads: usize,
 }
 
-impl<W: Write> Sink<'_, W> {
-    fn maybe_flush(&mut self) -> Result<(), Error> {
-        if self.buf.len() >= FLUSH_AT {
-            self.out.write_all(&self.buf)?;
-            self.buf.clear();
+impl WriteOptions {
+    fn threads(self) -> usize {
+        if self.threads > 0 {
+            self.threads
+        } else {
+            std::thread::available_parallelism().map_or(1, |n| n.get()).min(8)
+        }
+    }
+}
+
+type Sink<'s> = &'s mut dyn FnMut(Vec<u8>) -> Result<(), Error>;
+
+/// Small parts collect in `pending`; the big ones go out as chunks of their own, in order.
+struct Writer<'s> {
+    pending: Vec<u8>,
+    sink: Sink<'s>,
+    threads: usize,
+}
+
+impl Writer<'_> {
+    fn flush(&mut self) -> Result<(), Error> {
+        if !self.pending.is_empty() {
+            // a fresh buffer of the same room, so the next small parts do not grow it from nothing
+            let room = self.pending.capacity().min(FLUSH_AT + (FLUSH_AT >> 2));
+            let chunk = std::mem::replace(&mut self.pending, Vec::with_capacity(room));
+            (self.sink)(chunk)?;
         }
         Ok(())
     }
-    fn finish(self) -> Result<(), Error> {
-        self.out.write_all(&self.buf)?;
+
+    fn maybe_flush(&mut self) -> Result<(), Error> {
+        if self.pending.len() >= FLUSH_AT {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Renders rows `0..n` in chunks of `rows_per_chunk` (a chunk is `f(range, buf)`), on several threads when there
+    /// are enough rows, and passes the chunks on in row order.
+    fn parallel<F>(&mut self, n: usize, rows_per_chunk: usize, bytes_per_row: usize, f: F) -> Result<(), Error>
+    where
+        F: Fn(Range<usize>, &mut Vec<u8>) + Sync,
+    {
+        self.flush()?;
+        let chunks = n.div_ceil(rows_per_chunk);
+        let range = |c: usize| c * rows_per_chunk..((c + 1) * rows_per_chunk).min(n);
+        let threads = self.threads.min(chunks);
+        if threads <= 1 || n < PAR_MIN_ROWS {
+            for c in 0..chunks {
+                let mut buf = Vec::with_capacity(rows_per_chunk * bytes_per_row);
+                f(range(c), &mut buf);
+                (self.sink)(buf)?;
+            }
+            return Ok(());
+        }
+        let wave = threads * 4; // chunks in flight at once: bounds what is held
+        let mut first = 0;
+        while first < chunks {
+            let last = (first + wave).min(chunks);
+            let next = AtomicUsize::new(first);
+            let done: Vec<Mutex<Option<Vec<u8>>>> = (first..last).map(|_| Mutex::new(None)).collect();
+            std::thread::scope(|s| {
+                for _ in 0..threads {
+                    s.spawn(|| loop {
+                        let c = next.fetch_add(1, Ordering::Relaxed);
+                        if c >= last {
+                            break;
+                        }
+                        let mut buf = Vec::with_capacity(rows_per_chunk * bytes_per_row);
+                        f(range(c), &mut buf);
+                        *done[c - first].lock().expect("a worker panicked") = Some(buf);
+                    });
+                }
+            });
+            for slot in done {
+                (self.sink)(slot.into_inner().expect("a worker panicked").expect("every chunk is rendered"))?;
+            }
+            first = last;
+        }
         Ok(())
     }
 }
@@ -85,13 +160,16 @@ fn member_parts(m: &Member, props: &[MemberProp]) -> (Vec<u8>, Vec<u8>) {
 
 fn hierarchy_info(out: &mut Vec<u8>, h: &str, props: &[MemberProp]) {
     let mut e = Vec::new();
-    escape_into(&mut e, h);
+    escape_attr_into(&mut e, h);
     let e = String::from_utf8(e).expect("utf-8");
-    out.extend_from_slice(format!(
-        "<HierarchyInfo name=\"{e}\"><UName name=\"{e}.[MEMBER_UNIQUE_NAME]\" type=\"xsd:string\"/>\
+    out.extend_from_slice(
+        format!(
+            "<HierarchyInfo name=\"{e}\"><UName name=\"{e}.[MEMBER_UNIQUE_NAME]\" type=\"xsd:string\"/>\
 <Caption name=\"{e}.[MEMBER_CAPTION]\" type=\"xsd:string\"/><LName name=\"{e}.[LEVEL_UNIQUE_NAME]\" type=\"xsd:string\"/>\
 <LNum name=\"{e}.[LEVEL_NUMBER]\" type=\"xsd:int\"/><DisplayInfo name=\"{e}.[DISPLAY_INFO]\" type=\"xsd:unsignedInt\"/>"
-    ).as_bytes());
+        )
+        .as_bytes(),
+    );
     for p in props {
         out.extend_from_slice(format!("<{n} name=\"{e}.[{n}]\" type=\"xsd:string\"/>", n = p.name()).as_bytes());
     }
@@ -99,14 +177,16 @@ fn hierarchy_info(out: &mut Vec<u8>, h: &str, props: &[MemberProp]) {
 }
 
 /// The hierarchies of an axis in first-seen order (what its AxisInfo lists).
-fn axis_hierarchies(axis: &Axis) -> Vec<&str> {
+fn axis_hierarchies<'a>(axis: &'a Axis<'_>) -> Vec<&'a str> {
     let mut seen: Vec<&str> = vec![];
     match &axis.source {
         AxisSource::Tuples(t) => {
-            if let Some(first) = t.first() {
-                for m in first {
-                    if !seen.contains(&m.hierarchy.as_str()) {
-                        seen.push(&m.hierarchy);
+            if let Some(first) = t.tuples.first() {
+                for &k in first {
+                    if let Some(m) = t.members.get(k as usize) {
+                        if !seen.contains(&m.hierarchy.as_str()) {
+                            seen.push(&m.hierarchy);
+                        }
                     }
                 }
             }
@@ -120,204 +200,255 @@ fn axis_hierarchies(axis: &Axis) -> Vec<&str> {
     seen
 }
 
+/// A member's text cut where its key and caption go, so each value only fills two holes.
 enum Piece {
     Lit(Vec<u8>),
     Key,
     Caption,
 }
 
-const SAME_PARENT_TEXT: &str = "131072"; // SAME_PARENT
-const KEY: &[u8] = b"\x01K";
-const CAP: &[u8] = b"\x01C";
+/// The pieces of a level's members: what `member_parts` writes for a member whose unique name is
+/// `<hierarchy>.&[<key>]` and whose caption is the value's, built part by part (no text is searched for holes, so
+/// no text of a caller's can be mistaken for one). Before the DisplayInfo, and after it.
+fn level_pieces(m: &Member, props: &[MemberProp]) -> (Vec<Piece>, Vec<Piece>) {
+    fn push_lit(ps: &mut Vec<Piece>, bytes: &[u8]) {
+        match ps.last_mut() {
+            Some(Piece::Lit(l)) => l.extend_from_slice(bytes),
+            _ => ps.push(Piece::Lit(bytes.to_vec())),
+        }
+    }
+    fn unique(ps: &mut Vec<Piece>, h: &str) {
+        let mut e = Vec::new();
+        escape_into(&mut e, h);
+        e.extend_from_slice(b".&amp;[");
+        push_lit(ps, &e);
+        ps.push(Piece::Key);
+        push_lit(ps, b"]");
+    }
+    let mut head = vec![];
+    let esc = |s: &str| {
+        let mut e = Vec::new();
+        escape_into(&mut e, s);
+        e
+    };
+    let mut lit_head = Vec::from(&b"<Tuple><Member Hierarchy="[..]);
+    quote_attr_into(&mut lit_head, &m.hierarchy);
+    lit_head.extend_from_slice(b"><UName>");
+    push_lit(&mut head, &lit_head);
+    unique(&mut head, &m.hierarchy);
+    push_lit(&mut head, b"</UName><Caption>");
+    head.push(Piece::Caption);
+    let mut rest = Vec::from(&b"</Caption><LName>"[..]);
+    rest.extend_from_slice(&esc(&m.level_name));
+    rest.extend_from_slice(b"</LName><LNum>");
+    rest.extend_from_slice(itoa::Buffer::new().format(m.level_number).as_bytes());
+    rest.extend_from_slice(b"</LNum><DisplayInfo>");
+    push_lit(&mut head, &rest);
 
-fn pieces(bytes: &[u8]) -> Vec<Piece> {
-    let mut out = vec![];
-    let mut cur = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i..].starts_with(KEY) || bytes[i..].starts_with(CAP) {
-            if !cur.is_empty() {
-                out.push(Piece::Lit(std::mem::take(&mut cur)));
+    let mut tail = vec![];
+    push_lit(&mut tail, b"</DisplayInfo>");
+    for p in props {
+        push_lit(&mut tail, format!("<{}>", p.name()).as_bytes());
+        match p {
+            MemberProp::MemberUniqueName => unique(&mut tail, &m.hierarchy),
+            MemberProp::MemberCaption => tail.push(Piece::Caption),
+            other => {
+                let mut v = Vec::new();
+                prop_value(m, *other, &mut v);
+                push_lit(&mut tail, &v);
             }
-            out.push(if bytes[i + 1] == b'K' { Piece::Key } else { Piece::Caption });
-            i += 2;
-        } else {
-            cur.push(bytes[i]);
-            i += 1;
         }
+        push_lit(&mut tail, format!("</{}>", p.name()).as_bytes());
     }
-    if !cur.is_empty() {
-        out.push(Piece::Lit(cur));
-    }
-    out
+    push_lit(&mut tail, b"</Member></Tuple>");
+    (head, tail)
 }
 
-/// Reads a string array by row, whatever its string type; None for a null.
-type StrAt<'a> = Box<dyn Fn(usize) -> Option<&'a str> + 'a>;
-
-fn str_at<'a>(a: &'a ArrayRef) -> Result<StrAt<'a>, Error> {
-    match a.data_type() {
-        DataType::Utf8 => {
-            let s = a.as_string::<i32>();
-            Ok(Box::new(move |i| if s.is_null(i) { None } else { Some(s.value(i)) }))
-        }
-        DataType::LargeUtf8 => {
-            let s = a.as_string::<i64>();
-            Ok(Box::new(move |i| if s.is_null(i) { None } else { Some(s.value(i)) }))
-        }
-        DataType::Utf8View => {
-            let s = a.as_string_view();
-            Ok(Box::new(move |i| if s.is_null(i) { None } else { Some(s.value(i)) }))
-        }
-        t => Err(Error::Unsupported(format!("a level's keys must be a string array, not {t}"))),
+/// What a text needs to become XML text: nothing, escaping, and whether it holds `]` (doubled in a key).
+#[inline]
+fn classify(t: &[u8]) -> (bool, bool) {
+    let (mut special, mut bracket) = (false, false);
+    for &b in t {
+        special |= matches!(b, b'&' | b'<' | b'>' | 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0xEF);
+        bracket |= b == b']';
     }
+    (special, bracket)
 }
 
-fn write_axis<W: Write>(s: &mut Sink<W>, n: usize, axis: &Axis) -> Result<(), Error> {
-    lit(&mut s.buf, &format!("<Axis name=\"Axis{n}\"><Tuples>"));
+fn write_axis(w: &mut Writer<'_>, n: usize, axis: &Axis<'_>) -> Result<(), Error> {
+    lit(&mut w.pending, &format!("<Axis name=\"Axis{n}\"><Tuples>"));
     match &axis.source {
-        AxisSource::Tuples(tuples) => {
-            let infos = display_infos(tuples);
+        AxisSource::Tuples(t) => {
+            let width = t.tuples.first().map_or(0, Vec::len);
+            if t.tuples.iter().any(|x| x.len() != width || x.iter().any(|&k| k as usize >= t.members.len())) {
+                return Err(Error::Invalid("tuples of different widths, or a member index out of range".into()));
+            }
+            let infos = display_infos(&t.members, &t.tuples);
             // each member's XML once, however many tuples hold it
-            let mut parts: Vec<Option<(Vec<u8>, Vec<u8>)>> = vec![];
-            let mut idx: std::collections::HashMap<&Member, usize> = std::collections::HashMap::new();
-            for (t, di) in tuples.iter().zip(&infos) {
-                lit(&mut s.buf, "<Tuple>");
-                for (m, d) in t.iter().zip(di) {
-                    let k = *idx.entry(m).or_insert_with(|| {
-                        parts.push(None);
-                        parts.len() - 1
-                    });
-                    let (h, tl) = parts[k].get_or_insert_with(|| member_parts(m, &axis.properties));
-                    s.buf.extend_from_slice(h);
-                    lit(&mut s.buf, itoa::Buffer::new().format(*d));
-                    s.buf.extend_from_slice(tl);
+            let mut parts: Vec<Option<(Vec<u8>, Vec<u8>)>> = vec![None; t.members.len()];
+            for (i, tuple) in t.tuples.iter().enumerate() {
+                lit(&mut w.pending, "<Tuple>");
+                for (j, &k) in tuple.iter().enumerate() {
+                    let k = k as usize;
+                    let (h, tl) = parts[k].get_or_insert_with(|| member_parts(&t.members[k], &axis.properties));
+                    w.pending.extend_from_slice(h);
+                    lit(&mut w.pending, itoa::Buffer::new().format(infos[i * width + j]));
+                    w.pending.extend_from_slice(tl);
                 }
-                lit(&mut s.buf, "</Tuple>");
-                s.maybe_flush()?;
+                lit(&mut w.pending, "</Tuple>");
+                w.maybe_flush()?;
             }
         }
         AxisSource::Level(l) => {
             if let Some(all) = &l.all {
                 let info = children_bits(all) | if l.keys.is_empty() { 0 } else { DRILLED_DOWN };
                 let (h, t) = member_parts(all, &axis.properties);
-                lit(&mut s.buf, "<Tuple>");
-                s.buf.extend_from_slice(&h);
-                lit(&mut s.buf, itoa::Buffer::new().format(info));
-                s.buf.extend_from_slice(&t);
-                lit(&mut s.buf, "</Tuple>");
+                lit(&mut w.pending, "<Tuple>");
+                w.pending.extend_from_slice(&h);
+                lit(&mut w.pending, itoa::Buffer::new().format(info));
+                w.pending.extend_from_slice(&t);
+                lit(&mut w.pending, "</Tuple>");
             }
-            let mut proto = l.template.clone();
-            proto.unique_name = format!("{}.&[{}]", proto.hierarchy, "\x01K");
-            proto.caption = "\x01C".into();
-            let (h, t) = member_parts(&proto, &axis.properties);
-            let (head, tail) = (pieces(&h), pieces(&t));
-            let get = str_at(&l.keys)?;
-            let (mut key, mut cap) = (Vec::new(), Vec::new());
-            for i in 0..l.keys.len() {
-                let v = get(i);
-                key.clear();
-                cap.clear();
-                match v {
-                    None => escape_into(&mut cap, &l.blank_caption),
-                    Some(text) => {
-                        escape_into(&mut cap, text);
-                        if text.contains(']') {
-                            escape_into(&mut key, &text.replace(']', "]]"));
-                        } else {
-                            escape_into(&mut key, text);
+            let (head, tail) = level_pieces(&l.template, &axis.properties);
+            let mut blank = Vec::new();
+            escape_into(&mut blank, &l.blank_caption);
+            let keys = l.keys;
+            w.parallel(keys.len(), LEVEL_CHUNK_ROWS, 450, |range, out| {
+                let (mut key, mut cap) = (Vec::new(), Vec::new());
+                for i in range {
+                    let (key_b, cap_b): (&[u8], &[u8]) = match keys.text(i) {
+                        None => (b"", &blank),
+                        Some(text) => match classify(text) {
+                            (false, false) => (text, text),
+                            (special, bracket) => {
+                                cap.clear();
+                                if special {
+                                    escape_bytes_into(&mut cap, text);
+                                } else {
+                                    cap.extend_from_slice(text);
+                                }
+                                if bracket {
+                                    // the key: `]` doubled, then escaped (a `]` is not special to XML, so each run
+                                    // between two `]` is escaped as it is)
+                                    key.clear();
+                                    for (n, part) in text.split(|&b| b == b']').enumerate() {
+                                        if n > 0 {
+                                            key.extend_from_slice(b"]]");
+                                        }
+                                        escape_bytes_into(&mut key, part);
+                                    }
+                                    (&key, &cap)
+                                } else {
+                                    (&cap, &cap)
+                                }
+                            }
+                        },
+                    };
+                    let fill = |out: &mut Vec<u8>, ps: &[Piece]| {
+                        for p in ps {
+                            match p {
+                                Piece::Lit(b) => out.extend_from_slice(b),
+                                Piece::Key => out.extend_from_slice(key_b),
+                                Piece::Caption => out.extend_from_slice(cap_b),
+                            }
                         }
-                    }
+                    };
+                    fill(out, &head);
+                    out.extend_from_slice(if i == 0 { b"0" } else { SAME_PARENT_TEXT });
+                    fill(out, &tail);
                 }
-                lit(&mut s.buf, "<Tuple>");
-                for p in &head {
-                    match p {
-                        Piece::Lit(b) => s.buf.extend_from_slice(b),
-                        Piece::Key => s.buf.extend_from_slice(&key),
-                        Piece::Caption => s.buf.extend_from_slice(&cap),
-                    }
-                }
-                lit(&mut s.buf, if i == 0 { "0" } else { SAME_PARENT_TEXT });
-                for p in &tail {
-                    match p {
-                        Piece::Lit(b) => s.buf.extend_from_slice(b),
-                        Piece::Key => s.buf.extend_from_slice(&key),
-                        Piece::Caption => s.buf.extend_from_slice(&cap),
-                    }
-                }
-                lit(&mut s.buf, "</Tuple>");
-                s.maybe_flush()?;
-            }
+            })?;
         }
     }
-    lit(&mut s.buf, "</Tuples></Axis>");
+    lit(&mut w.pending, "</Tuples></Axis>");
     Ok(())
 }
 
-/// One column's cells, typed once.
-enum Cells<'a> {
-    F64(&'a arrow_array::Float64Array),
-    F32(&'a arrow_array::Float32Array),
-    F16(&'a arrow_array::Float16Array),
-    I64(&'a arrow_array::Int64Array),
-    I32(&'a arrow_array::Int32Array),
-    I16(&'a arrow_array::Int16Array),
-    I8(&'a arrow_array::Int8Array),
-    U64(&'a arrow_array::UInt64Array),
-    U32(&'a arrow_array::UInt32Array),
-    U16(&'a arrow_array::UInt16Array),
-    U8(&'a arrow_array::UInt8Array),
-    Str(StrAt<'a>),
+/// One column of cells, ready to write.
+struct Col<'a> {
+    array: Array<'a>,
+    /// The cell's other properties (only those asked for, in order), after its value.
+    tail: Vec<u8>,
 }
 
-fn cells_of(a: &ArrayRef) -> Result<Cells<'_>, Error> {
-    Ok(match a.data_type() {
-        DataType::Float64 => Cells::F64(a.as_primitive::<Float64Type>()),
-        DataType::Float32 => Cells::F32(a.as_primitive::<Float32Type>()),
-        DataType::Float16 => Cells::F16(a.as_primitive::<Float16Type>()),
-        DataType::Int64 => Cells::I64(a.as_primitive::<Int64Type>()),
-        DataType::Int32 => Cells::I32(a.as_primitive::<Int32Type>()),
-        DataType::Int16 => Cells::I16(a.as_primitive::<Int16Type>()),
-        DataType::Int8 => Cells::I8(a.as_primitive::<Int8Type>()),
-        DataType::UInt64 => Cells::U64(a.as_primitive::<UInt64Type>()),
-        DataType::UInt32 => Cells::U32(a.as_primitive::<UInt32Type>()),
-        DataType::UInt16 => Cells::U16(a.as_primitive::<UInt16Type>()),
-        DataType::UInt8 => Cells::U8(a.as_primitive::<UInt8Type>()),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Cells::Str(str_at(a)?),
-        t => return Err(Error::Unsupported(format!("a measure column of type {t}"))),
-    })
+#[inline]
+fn open_cell(b: &mut Vec<u8>, ordinal: u64, ty: &[u8]) {
+    b.extend_from_slice(b"<Cell CellOrdinal=\"");
+    b.extend_from_slice(itoa::Buffer::new().format(ordinal).as_bytes());
+    b.extend_from_slice(b"\"><Value xsi:type=\"");
+    b.extend_from_slice(ty);
+    b.extend_from_slice(b"\">");
+}
+
+#[inline]
+fn close_cell(b: &mut Vec<u8>, tail: &[u8]) {
+    b.extend_from_slice(b"</Value>");
+    b.extend_from_slice(tail);
+    b.extend_from_slice(b"</Cell>");
 }
 
 macro_rules! int_cell {
-    ($a:expr, $i:expr, $buf:expr, $ord:expr, $tail:expr) => {
-        if $a.is_null($i) {
-            false
-        } else {
-            open_cell($buf, $ord, "xsd:int");
-            lit($buf, itoa::Buffer::new().format($a.value($i)));
-            close_cell($buf, $tail);
-            true
+    ($vals:expr, $r:expr, $b:expr, $ord:expr, $tail:expr) => {{
+        open_cell($b, $ord, b"xsd:int");
+        $b.extend_from_slice(itoa::Buffer::new().format($vals[$r]).as_bytes());
+        close_cell($b, $tail);
+    }};
+}
+
+/// The cell at `(row, column)` when it has a value. With `with_value` false the cell carries only its other
+/// properties.
+fn write_cell(b: &mut Vec<u8>, ord: u64, col: &Col<'_>, r: usize, with_value: bool) {
+    if !col.array.is_valid(r) {
+        return;
+    }
+    if !with_value {
+        if matches!(col.array.values, Values::Utf8 { .. } | Values::LargeUtf8 { .. } | Values::Utf8View { .. }) && col.array.text(r).is_none() {
+            return;
         }
-    };
+        b.extend_from_slice(b"<Cell CellOrdinal=\"");
+        b.extend_from_slice(itoa::Buffer::new().format(ord).as_bytes());
+        b.extend_from_slice(b"\">");
+        b.extend_from_slice(&col.tail);
+        b.extend_from_slice(b"</Cell>");
+        return;
+    }
+    let tail = &col.tail[..];
+    match col.array.values {
+        Values::F64(v) => {
+            open_cell(b, ord, b"xsd:double");
+            write_f64(b, v[r]);
+            close_cell(b, tail);
+        }
+        Values::F32(v) => {
+            open_cell(b, ord, b"xsd:double");
+            write_f64(b, f64::from(v[r]));
+            close_cell(b, tail);
+        }
+        Values::I64(v) => int_cell!(v, r, b, ord, tail),
+        Values::I32(v) => int_cell!(v, r, b, ord, tail),
+        Values::I16(v) => int_cell!(v, r, b, ord, tail),
+        Values::I8(v) => int_cell!(v, r, b, ord, tail),
+        Values::U64(v) => int_cell!(v, r, b, ord, tail),
+        Values::U32(v) => int_cell!(v, r, b, ord, tail),
+        Values::U16(v) => int_cell!(v, r, b, ord, tail),
+        Values::U8(v) => int_cell!(v, r, b, ord, tail),
+        Values::Utf8 { .. } | Values::LargeUtf8 { .. } | Values::Utf8View { .. } => {
+            if let Some(text) = col.array.text(r) {
+                open_cell(b, ord, b"xsd:string");
+                if needs_escape(text) {
+                    escape_bytes_into(b, text);
+                } else {
+                    b.extend_from_slice(text);
+                }
+                close_cell(b, tail);
+            }
+        }
+    }
 }
 
-fn open_cell(b: &mut Vec<u8>, ordinal: u64, ty: &str) {
-    lit(b, "<Cell CellOrdinal=\"");
-    lit(b, itoa::Buffer::new().format(ordinal));
-    lit(b, "\"><Value xsi:type=\"");
-    lit(b, ty);
-    lit(b, "\">");
-}
-
-fn close_cell(b: &mut Vec<u8>, tail: &[u8]) {
-    lit(b, "</Value>");
-    b.extend_from_slice(tail);
-    lit(b, "</Cell>");
-}
-
-fn write_cells<W: Write>(s: &mut Sink<W>, cs: &Cellset) -> Result<(), Error> {
+fn write_cells(w: &mut Writer<'_>, cs: &Cellset<'_>) -> Result<(), Error> {
     let with_value = cs.cell_properties.iter().any(|p| p.name == "VALUE");
-    let ncols = cs.columns.len() as u64;
+    let ncols = cs.columns.len();
     if ncols == 0 {
         return Ok(());
     }
@@ -325,12 +456,12 @@ fn write_cells<W: Write>(s: &mut Sink<W>, cs: &Cellset) -> Result<(), Error> {
     if cs.columns.iter().any(|c| c.values.len() != rows) {
         return Err(Error::Invalid("the columns are not of one length".into()));
     }
-    // per column: its cell's other properties (only those asked for, in order)
-    let tails: Vec<Vec<u8>> = cs
+    let cols: Vec<Col<'_>> = cs
         .columns
         .iter()
         .map(|c| {
-            let mut t = Vec::new();
+            c.values.check()?;
+            let mut tail = Vec::new();
             for p in &cs.cell_properties {
                 let value = match p.name.as_str() {
                     "FORMAT_STRING" => {
@@ -341,116 +472,43 @@ fn write_cells<W: Write>(s: &mut Sink<W>, cs: &Cellset) -> Result<(), Error> {
                     "LANGUAGE" => cs.language.to_string().into_bytes(),
                     _ => continue,
                 };
-                lit(&mut t, &format!("<{}>", p.element));
-                t.extend_from_slice(&value);
-                lit(&mut t, &format!("</{}>", p.element));
+                lit(&mut tail, &format!("<{}>", p.element));
+                tail.extend_from_slice(&value);
+                lit(&mut tail, &format!("</{}>", p.element));
             }
-            t
+            Ok(Col { array: c.values, tail })
         })
-        .collect();
-    let typed: Vec<Cells> = cs.columns.iter().map(|c| cells_of(&c.values)).collect::<Result<_, _>>()?;
-    let mut tmp = Vec::new();
-    for r in 0..rows {
-        for (c, col) in typed.iter().enumerate() {
-            let ord = r as u64 * ncols + c as u64;
-            let tail = &tails[c][..];
-            let b = &mut s.buf;
-            if !with_value {
-                // a cell with no value property: written for every row that has a value
-                let present = match col {
-                    Cells::F64(a) => !a.is_null(r),
-                    Cells::F32(a) => !a.is_null(r),
-                    Cells::F16(a) => !a.is_null(r),
-                    Cells::I64(a) => !a.is_null(r),
-                    Cells::I32(a) => !a.is_null(r),
-                    Cells::I16(a) => !a.is_null(r),
-                    Cells::I8(a) => !a.is_null(r),
-                    Cells::U64(a) => !a.is_null(r),
-                    Cells::U32(a) => !a.is_null(r),
-                    Cells::U16(a) => !a.is_null(r),
-                    Cells::U8(a) => !a.is_null(r),
-                    Cells::Str(g) => g(r).is_some(),
-                };
-                if present {
-                    lit(b, "<Cell CellOrdinal=\"");
-                    lit(b, itoa::Buffer::new().format(ord));
-                    lit(b, "\">");
-                    b.extend_from_slice(tail);
-                    lit(b, "</Cell>");
-                }
-                continue;
+        .collect::<Result<_, Error>>()?;
+    let rows_per_chunk = (CELL_CHUNK_CELLS / ncols).max(256);
+    w.parallel(rows, rows_per_chunk, ncols * 90, |range, out| {
+        for r in range {
+            for (c, col) in cols.iter().enumerate() {
+                write_cell(out, (r * ncols + c) as u64, col, r, with_value);
             }
-            match col {
-                Cells::F64(a) => {
-                    if !a.is_null(r) {
-                        open_cell(b, ord, "xsd:double");
-                        write_f64(b, a.value(r));
-                        close_cell(b, tail);
-                    }
-                }
-                Cells::F32(a) => {
-                    if !a.is_null(r) {
-                        open_cell(b, ord, "xsd:double");
-                        write_f64(b, f64::from(a.value(r)));
-                        close_cell(b, tail);
-                    }
-                }
-                Cells::F16(a) => {
-                    if !a.is_null(r) {
-                        open_cell(b, ord, "xsd:double");
-                        write_f64(b, a.value(r).to_f64());
-                        close_cell(b, tail);
-                    }
-                }
-                Cells::I64(a) => {
-                    int_cell!(a, r, b, ord, tail);
-                }
-                Cells::I32(a) => {
-                    int_cell!(a, r, b, ord, tail);
-                }
-                Cells::I16(a) => {
-                    int_cell!(a, r, b, ord, tail);
-                }
-                Cells::I8(a) => {
-                    int_cell!(a, r, b, ord, tail);
-                }
-                Cells::U64(a) => {
-                    int_cell!(a, r, b, ord, tail);
-                }
-                Cells::U32(a) => {
-                    int_cell!(a, r, b, ord, tail);
-                }
-                Cells::U16(a) => {
-                    int_cell!(a, r, b, ord, tail);
-                }
-                Cells::U8(a) => {
-                    int_cell!(a, r, b, ord, tail);
-                }
-                Cells::Str(g) => {
-                    if let Some(text) = g(r) {
-                        open_cell(b, ord, "xsd:string");
-                        tmp.clear();
-                        escape_into(&mut tmp, text);
-                        b.extend_from_slice(&tmp);
-                        close_cell(b, tail);
-                    }
+        }
+    })
+}
+
+impl Cellset<'_> {
+    /// Writes the cellset as a series of chunks of about 1 MB, each handed to `sink` in order.
+    pub fn write_chunks(&self, opts: WriteOptions, sink: &mut dyn FnMut(Vec<u8>) -> Result<(), Error>) -> Result<(), Error> {
+        for axis in &self.axes {
+            if let AxisSource::Level(l) = &axis.source {
+                l.keys.check()?;
+                if !l.keys.is_text() {
+                    return Err(Error::Unsupported("a level's keys must be a text array".into()));
                 }
             }
         }
-        s.maybe_flush()?;
-    }
-    Ok(())
-}
-
-impl Cellset {
-    /// Writes the cellset to `out` in chunks (an answer is sent while it is built, never held whole).
-    pub fn write_to<W: Write>(&self, out: &mut W) -> Result<(), Error> {
-        let mut s = Sink { buf: Vec::with_capacity(FLUSH_AT + (FLUSH_AT >> 2)), out };
-        let b = &mut s.buf;
-        lit(b, &format!(
-            "<root xmlns=\"{XA}:mddataset\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\
+        let mut w = Writer { pending: Vec::with_capacity(FLUSH_AT + (FLUSH_AT >> 2)), sink, threads: opts.threads() };
+        let b = &mut w.pending;
+        lit(
+            b,
+            &format!(
+                "<root xmlns=\"{XA}:mddataset\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\
 <OlapInfo><CubeInfo><Cube><CubeName>"
-        ));
+            ),
+        );
         escape_into(b, &self.cube_name);
         lit(b, "</CubeName></Cube></CubeInfo><AxesInfo>");
         for (n, axis) in self.axes.iter().enumerate() {
@@ -478,9 +536,9 @@ impl Cellset {
         }
         lit(b, "</CellInfo></OlapInfo><Axes>");
         for (n, axis) in self.axes.iter().enumerate() {
-            write_axis(&mut s, n, axis)?;
+            write_axis(&mut w, n, axis)?;
         }
-        let b = &mut s.buf;
+        let b = &mut w.pending;
         if self.slicer.is_empty() {
             lit(b, "<Axis name=\"SlicerAxis\"><Tuples/></Axis>");
         } else {
@@ -494,9 +552,14 @@ impl Cellset {
             lit(b, "</Tuple></Tuples></Axis>");
         }
         lit(b, "</Axes><CellData>");
-        write_cells(&mut s, self)?;
-        lit(&mut s.buf, "</CellData></root>");
-        s.finish()
+        write_cells(&mut w, self)?;
+        lit(&mut w.pending, "</CellData></root>");
+        w.flush()
+    }
+
+    /// Writes the cellset to `out`.
+    pub fn write_to<W: Write>(&self, out: &mut W) -> Result<(), Error> {
+        self.write_chunks(WriteOptions::default(), &mut |chunk| Ok(out.write_all(&chunk)?))
     }
 
     pub fn to_vec(&self) -> Result<Vec<u8>, Error> {
