@@ -222,8 +222,15 @@ jobs:
     permissions:
       id-token: write # trusted publishing
     steps:
+      # only what is published: the wheels and the sdist (not the benchmarks' bench.json)
       - uses: actions/download-artifact@v4
         with:
+          pattern: wheels-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      - run: ls -l dist
       - uses: pypa/gh-action-pypi-publish@release/v1
