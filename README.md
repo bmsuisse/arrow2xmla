@@ -185,14 +185,16 @@ cells = [cols["revenue"], cols["orders"]]  # the values: their first row is the 
 # LevelAxis(customer_member, keys, all=all_member), CellValues(cells[0]), ... -> Cellset -> to_xml() / write_to(), as in the quick start
 ```
 
-**Reshaping: a result that is not in that order.** Register it in DuckDB, sort and add the All row in SQL, and read the columns
-from the query:
+**Reshaping: a result that is not in that order.** Copy it into a DuckDB table once (a registered Arrow stream can be read only
+once on DuckDB before 1.5, and the two queries below read the result twice), sort and add the All row in SQL, and read the
+columns from the queries:
 
 ```python
 import duckdb
 
 con = duckdb.connect()
-con.register("result", raw)  # raw: an arrowbricks result, one row per customer
+con.register("raw_result", raw)  # raw: an arrowbricks result, one row per customer
+con.execute("create table result as select * from raw_result")  # one read of the stream; every query after reads the table
 keys = ax.columns(con.sql("select customer from result order by customer nulls last"))["customer"]
 cells = ax.columns(con.sql("""select revenue, orders from (
     select 0 as k, null as customer, sum(revenue) as revenue, sum(orders) as orders from result
