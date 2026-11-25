@@ -62,9 +62,11 @@ pip install arrow2xmla
 Python 3.10+, one `abi3` wheel per platform (Linux, macOS, Windows). `pyarrow` is optional: any library that exports the
 Arrow PyCapsule interface works (`pyarrow`, `nanoarrow`, ...; a `polars` Series goes through `pyarrow`, or `.to_arrow()` it first).
 
+The Rust crate is not published on crates.io; the package is PyPI only. To use the crate from Rust, depend on it from git
+(Rust 1.88+):
+
 ```toml
-# Cargo.toml (Rust 1.88+)
-arrow2xmla = "0.2"
+arrow2xmla = { git = "https://github.com/bmsuisse/arrow2xmla", tag = "v0.2.0" }
 ```
 
 ## Quick start
