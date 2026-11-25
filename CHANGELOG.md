@@ -5,8 +5,10 @@
 - **No Arrow library needed.** `columns(table)` reads the columns of anything that exports `__arrow_c_stream__`: a DuckDB
   relation, a polars DataFrame, a pyarrow Table. The batches are copied once into one array per column (`ArrowColumn`), which
   `CellValues`, `LevelAxis` and `Rowset` take like any Arrow array. A polars Series or any one-column stream is now taken
-  directly (it needed pyarrow before). Floats, integers and text; anything else (DuckDB's `DECIMAL`, dates, booleans, ...)
-  raises `UnsupportedTypeError` naming the column and saying to cast it in the query.
+  directly (it needed pyarrow before). Floats, integers, text and decimals; anything else (dates, booleans, ...) raises
+  `UnsupportedTypeError` naming the column and saying to cast it in the query.
+- **DuckDB's `DECIMAL` and `HUGEINT`** (the types of literals, `sum` and `avg`) are read through `columns()`: a whole-number
+  decimal as int64 when it fits, otherwise a double. No casts are needed in a query.
 - The sample is DuckDB (`examples/quickstart.py`), and CI runs it in an environment without pyarrow.
 
 ## 0.2.0

@@ -68,10 +68,11 @@ def columns(table: Any) -> dict[str, Any]:
     """The columns of an Arrow table or stream by name, ready for `CellValues`, `LevelAxis` and `Rowset`. No Arrow library
     is needed: anything that exports `__arrow_c_stream__` works (a DuckDB relation, a polars DataFrame, a pyarrow Table).
 
-        columns(duckdb.sql("select name, sum(x)::DOUBLE as total from t group by name"))["total"]
+        columns(duckdb.sql("select name, sum(x) as total from t group by name"))["total"]
 
-    The batches are copied once into one array per column. Types: floats, integers and text; anything else (decimals, dates,
-    booleans, ...) raises `UnsupportedTypeError`: cast it in the query."""
+    The batches are copied once into one array per column. Types: floats, integers, text, and decimals (DuckDB's `DECIMAL` and
+    `HUGEINT`): a decimal is read as an int64 when its scale is 0 and every value fits, else as a double. Anything else (dates,
+    booleans, 256-bit decimals, ...) raises `UnsupportedTypeError` naming the column: cast it in the query."""
     from arrow2xmla import _native
 
     if not hasattr(table, "__arrow_c_stream__"):

@@ -18,16 +18,16 @@ con.sql("""
 
 # one row per customer: the rows of the pivot (NULL is the blank member, sorted last)
 by_customer = """
-    select customer, sum(amount)::double as revenue, count(*)::bigint as orders
+    select customer, sum(amount) as revenue, count(*) as orders
     from orders group by customer
 """
 customers = ax.columns(con.sql(f"select customer from ({by_customer}) order by customer nulls last"))["customer"]
 
-# the cells: the All row first, then the customers in the same order. DuckDB types sums and literals as DECIMAL or HUGEINT,
-# which are not written: cast to DOUBLE / BIGINT in the query.
+# the cells: the All row first, then the customers in the same order. DuckDB's DECIMAL (the type of `sum(amount)`) and HUGEINT
+# (the type of a sum of integers) are read as a double and an int64.
 cells = ax.columns(con.sql(f"""
     select revenue, orders from (
-        select 0 as k, null as customer, sum(revenue) as revenue, sum(orders)::bigint as orders from ({by_customer})
+        select 0 as k, null as customer, sum(revenue) as revenue, sum(orders) as orders from ({by_customer})
         union all
         select 1, customer, revenue, orders from ({by_customer})
     ) order by k, customer nulls last

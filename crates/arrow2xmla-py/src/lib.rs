@@ -313,15 +313,41 @@ impl ArrowColumn {
     }
 }
 
+/// A decimal column (`d:precision,scale[,bits]`): its unscaled integers, converted when the column is finished.
+struct Dec {
+    scale: i32,
+    width: usize,
+    vals: Vec<i128>,
+}
+
+/// `(scale, bytes per value)` of a decimal format: `d:precision,scale` (128 bits) or `d:precision,scale,32|64|128`.
+fn parse_decimal(format: &str) -> Option<(i32, usize)> {
+    let mut parts = format.strip_prefix("d:")?.split(',');
+    let _precision: u32 = parts.next()?.parse().ok()?;
+    let scale: i32 = parts.next()?.parse().ok()?;
+    let bits: usize = match parts.next() {
+        None => 128,
+        Some(b) => b.parse().ok()?,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    matches!(bits, 32 | 64 | 128).then_some((scale, bits / 8))
+}
+
 /// Copies of one column's batches, appended.
 struct Acc {
     owned: Owned,
+    dec: Option<Dec>,
     valid: Vec<bool>,
     nulls: bool,
 }
 
 impl Acc {
     fn new(format: &str, name: &str) -> PyResult<Acc> {
+        if let Some((scale, width)) = parse_decimal(format) {
+            return Ok(Acc { owned: Owned::F64(vec![]), dec: Some(Dec { scale, width, vals: vec![] }), valid: vec![], nulls: false });
+        }
         let owned = match format {
             "g" => Owned::F64(vec![]),
             "f" => Owned::F32(vec![]),
@@ -337,10 +363,47 @@ impl Acc {
             "u" | "U" | "vu" => Owned::Text { offsets: vec![0], data: vec![] },
             other => {
                 let what = if name.is_empty() { "an Arrow array".to_string() } else { format!("column {name:?}") };
-                return Err(UnsupportedTypeError::new_err(format!("{what} has Arrow format {other:?}, which is not supported (floats, integers, text): cast it first (in a query: `x::DOUBLE`, `x::BIGINT`, `x::VARCHAR`)")));
+                return Err(UnsupportedTypeError::new_err(format!("{what} has Arrow format {other:?}, which is not supported (floats, integers, decimals, text): cast it first (in a query: `x::DOUBLE`, `x::BIGINT`, `x::VARCHAR`)")));
             }
         };
-        Ok(Acc { owned, valid: vec![], nulls: false })
+        Ok(Acc { owned, dec: None, valid: vec![], nulls: false })
+    }
+
+    /// Appends the values of a decimal array (read as the little-endian integers the Arrow layout says they are).
+    fn push_decimal(&mut self, array: &ArrowArray) -> PyResult<()> {
+        let dec = self.dec.as_mut().expect("a decimal column");
+        if !array.dictionary.is_null() || array.n_children != 0 {
+            return Err(bad("a dictionary or nested array: cast it to its plain type first"));
+        }
+        if array.null_count < -1 {
+            return Err(bad("an Arrow array with an invalid null count"));
+        }
+        let len = count(array.length, "length")?;
+        let off = count(array.offset, "offset")?;
+        let end = off.checked_add(len).ok_or_else(|| bad("an Arrow array too long"))?;
+        if count(array.n_buffers, "buffer count")? < 2 || array.buffers.is_null() {
+            return Err(bad("an Arrow array with too few buffers"));
+        }
+        // SAFETY: the buffers are those the array declares, as long as it says (the interface has no way to say more)
+        let (data, bits) = unsafe {
+            let buffers = std::slice::from_raw_parts(array.buffers, 2);
+            let data = slice::<u8>(buffers[1], end.checked_mul(dec.width).ok_or_else(|| bad("an Arrow array too long"))?, "data")?;
+            let bits = if array.null_count != 0 && !buffers[0].is_null() { Some(slice::<u8>(buffers[0], end.div_ceil(8), "validity")?) } else { None };
+            (data, bits)
+        };
+        for i in off..end {
+            let ok = bits.is_none_or(|b| b[i >> 3] >> (i & 7) & 1 == 1);
+            let raw = &data[i * dec.width..(i + 1) * dec.width];
+            let v = match dec.width {
+                4 => i128::from(i32::from_le_bytes(raw.try_into().expect("4 bytes"))),
+                8 => i128::from(i64::from_le_bytes(raw.try_into().expect("8 bytes"))),
+                _ => i128::from_le_bytes(raw.try_into().expect("16 bytes")),
+            };
+            dec.vals.push(if ok { v } else { 0 }); // what a null row holds is not to be read
+            self.nulls |= !ok;
+            self.valid.push(ok);
+        }
+        Ok(())
     }
 
     fn push(&mut self, a: &Array<'_>) {
@@ -374,8 +437,19 @@ impl Acc {
         }
     }
 
-    fn finish(self) -> ArrowColumn {
+    fn finish(mut self) -> ArrowColumn {
         let len = self.valid.len();
+        if let Some(d) = self.dec.take() {
+            // a decimal is read as the number Excel holds it as: a whole number as int64 when they all fit, else a double
+            // (the unscaled value divided by 10^scale: exact for what a double holds, correctly rounded beyond)
+            self.owned = if d.scale == 0 && d.vals.iter().all(|v| i64::try_from(*v).is_ok()) {
+                Owned::I64(d.vals.iter().map(|v| *v as i64).collect())
+            } else if d.scale < 0 {
+                Owned::F64(d.vals.iter().map(|v| *v as f64 * 10f64.powi(-d.scale)).collect())
+            } else {
+                Owned::F64(d.vals.iter().map(|v| *v as f64 / 10f64.powi(d.scale)).collect())
+            };
+        }
         let validity = self.nulls.then(|| {
             let mut bits = vec![0u8; len.div_ceil(8)];
             for (i, ok) in self.valid.iter().enumerate() {
@@ -468,24 +542,28 @@ fn read_stream(obj: &Bound<'_, PyAny>) -> PyResult<Vec<(Option<String>, ArrowCol
                 }
             }
             for (j, acc) in accs.iter_mut().enumerate() {
-                let array = if is_table {
+                let view;
+                let array: &ArrowArray = if is_table {
                     let child = *batch.0.children.add(j);
                     if child.is_null() {
                         return Err(bad("an Arrow table batch without one of its columns"));
                     }
                     // the offset of a struct applies to its children
-                    let mut view = std::ptr::read(child);
-                    view.offset = view.offset.checked_add(batch.0.offset).ok_or_else(|| bad("an Arrow array too long"))?;
-                    view.length = batch.0.length;
-                    import_raw(child_schema(j), &view, &mut keep)?
+                    let mut copy = std::ptr::read(child);
+                    copy.offset = copy.offset.checked_add(batch.0.offset).ok_or_else(|| bad("an Arrow array too long"))?;
+                    copy.length = batch.0.length;
+                    view = copy;
+                    &view
                 } else {
-                    if batch.0.release.is_none() {
-                        return Err(bad("an Arrow array that was already released"));
-                    }
-                    import_raw(child_schema(j), &batch.0, &mut keep)?
+                    &batch.0
                 };
-                array.check().map_err(|e| bad(e.to_string()))?;
-                acc.push(&array);
+                if acc.dec.is_some() {
+                    acc.push_decimal(array)?;
+                } else {
+                    let a = import_raw(child_schema(j), array, &mut keep)?;
+                    a.check().map_err(|e| bad(e.to_string()))?;
+                    acc.push(&a);
+                }
             }
         }
         drop(keep);

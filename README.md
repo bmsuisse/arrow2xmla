@@ -82,14 +82,14 @@ from arrow2xmla import CellValues, Cellset, Discover, Execute, LevelAxis, Member
 
 con = duckdb.connect()
 con.sql("create table orders as select * from (values ('Acme', 1000.5), ('Acme', 500.0), ('Globex', 920.0), (NULL, 77.25)) t(customer, amount)")
-by_customer = "select customer, sum(amount)::double as revenue, count(*)::bigint as orders from orders group by customer"
+by_customer = "select customer, sum(amount) as revenue, count(*) as orders from orders group by customer"
 
 # the rows of the pivot: one member per customer, read from the result of a query (NULL is the blank member)
 customers = ax.columns(con.sql(f"select customer from ({by_customer}) order by customer nulls last"))["customer"]
 # the cells: the All row first, then the customers in the same order
 cells = ax.columns(con.sql(f"""
     select revenue, orders from (
-        select 0 as k, null as customer, sum(revenue) as revenue, sum(orders)::bigint as orders from ({by_customer})
+        select 0 as k, null as customer, sum(revenue) as revenue, sum(orders) as orders from ({by_customer})
         union all select 1, customer, revenue, orders from ({by_customer})
     ) order by k, customer nulls last"""))
 
@@ -111,9 +111,13 @@ match request.call:
     case Discover(request_type=kind): ...
 ```
 
-`ax.columns(...)` takes the result of any query. DuckDB types literals and sums as `DECIMAL` or `HUGEINT`, which are not written: cast
-them in the query (`::DOUBLE`, `::BIGINT`), as above; the error says which column. The same works with polars
-(`ax.columns(df)`) and pyarrow (`ax.columns(table)`), and arrays you already hold (`pa.array([...])`) go straight into `CellValues`.
+`ax.columns(...)` takes the result of any query, with no casts: DuckDB's `DECIMAL` (what `sum(amount)` and decimal literals are)
+is read as a double, and a whole-number decimal or `HUGEINT` (a sum of integers) as an int64 when it fits. The same works with
+polars (`ax.columns(df)`) and pyarrow (`ax.columns(table)`), and arrays you already hold (`pa.array([...])`) go straight into
+`CellValues`.
+
+Tested with DuckDB 1.1.3, 1.2.2, 1.3.2, 1.4.4, 1.5.2 and 2.0.1, in an environment without pyarrow (CI runs the sample against
+several of them). Older DuckDB does not export Arrow streams.
 
 ### In Rust
 
@@ -208,9 +212,10 @@ byte is written:
 |---|---|
 | `int8` … `int64`, `uint8` … `uint64` | `xsd:int`; `xsd:long` / `xsd:unsignedLong` when 32 bits do not hold the value |
 | `float16`, `float32`, `float64` | `xsd:double`, Python's shortest `repr` digits; `NaN`, `INF`, `-INF` |
+| `decimal32`/`64`/`128` (via `columns()`; DuckDB's `DECIMAL` and `HUGEINT`) | `xsd:int` / `xsd:long` when the scale is 0 and every value fits 64 bits, else `xsd:double` (the unscaled value divided by 10^scale) |
 | `string`, `large_string`, `string_view` | `xsd:string`, escaped |
 | null | no value: the cell is left out |
-| anything else (bool, dates, decimals, dictionaries, ...) | refused with `UnsupportedTypeError`: cast it first |
+| anything else (bool, dates, 256-bit decimals, dictionaries, ...) | refused with `UnsupportedTypeError`, naming the column: cast it first |
 
 Characters XML 1.0 forbids are replaced with U+FFFD, so Excel's parser accepts the answer. Chunked arrays are combined
 first. Only `VALUE`, `FORMAT_STRING` and `LANGUAGE` are written in a cell (`CellProperty`); a property that is not

@@ -97,12 +97,45 @@ def test_a_table_is_not_a_column_and_a_column_is_not_a_table() -> None:
 
 @pytest.mark.parametrize(
     "array",
-    [pa.array([True]), pa.array([1], pa.timestamp("s")), pa.array([1], pa.date32()), pa.array([1]).dictionary_encode(), pa.array([[1]]), pa.array([1], pa.decimal128(10, 2))],
-    ids=["bool", "timestamp", "date", "dictionary", "list", "decimal"],
+    [pa.array([True]), pa.array([1], pa.timestamp("s")), pa.array([1], pa.date32()), pa.array([1]).dictionary_encode(), pa.array([[1]]), pa.array([1], pa.decimal256(40, 2))],
+    ids=["bool", "timestamp", "date", "dictionary", "list", "decimal256"],
 )  # fmt: skip
 def test_what_is_not_written_names_its_column(array: pa.Array) -> None:
     with pytest.raises(ax.UnsupportedTypeError, match='column "weird"'):
         ax.columns(pa.table({"weird": array}))
+
+
+@pytest.mark.parametrize("typ", [pa.decimal32(7, 2), pa.decimal64(15, 2), pa.decimal128(20, 2)], ids=lambda t: str(t))
+def test_decimals_are_read_as_doubles_with_their_nulls(typ: pa.DataType) -> None:
+    from decimal import Decimal
+
+    t = pa.table({"k": pa.array(["a", "b", "c", "d"]), "v": pa.array([Decimal("1500.50"), None, Decimal("-2.25"), Decimal("0.07")], typ)})
+    cols = ax.columns(t)
+    assert cols["v"].type == "double" and "1 null" in repr(cols["v"])
+    xml = ax.Cellset("C", [ax.CellValues(cols["v"], "0")], ax.LevelAxis(M, cols["k"])).to_xml().decode()
+    assert ">1500.5<" in xml and ">-2.25<" in xml and ">0.07<" in xml
+    assert 'CellOrdinal="1"' not in xml, "the null row has no cell, and what it held is not read"
+
+
+def test_a_whole_number_decimal_is_an_integer_when_it_fits_and_a_double_when_not() -> None:
+    from decimal import Decimal
+
+    fits = ax.columns(pa.table({"v": pa.array([Decimal(7), None, Decimal(-(2**62))], pa.decimal128(30, 0))}))["v"]
+    assert fits.type == "int64"
+    big = ax.columns(pa.table({"v": pa.array([Decimal(7), Decimal(2**70)], pa.decimal128(30, 0))}))["v"]
+    assert big.type == "double"
+    scaled = ax.columns(pa.table({"v": pa.array([Decimal("1E+3"), Decimal("3E+2")], pa.decimal128(5, -2))}))["v"]
+    assert scaled.type == "double"
+    xml = ax.Cellset("C", [ax.CellValues(scaled, "0")], ax.LevelAxis(M, ax.columns(pa.table({"k": ["x", "y"]}))["k"])).to_xml().decode()
+    assert ">1000.0<" in xml and ">300.0<" in xml
+
+
+def test_a_decimal_column_over_many_batches() -> None:
+    from decimal import Decimal
+
+    parts = [pa.table({"v": pa.array([Decimal(f"{i}.25") for i in range(n)], pa.decimal128(12, 2))}) for n in (3, 0, 5)]
+    col = ax.columns(pa.concat_tables(parts))["v"]
+    assert len(col) == 8 and col.type == "double"
 
 
 def test_a_column_is_reusable_and_read_only() -> None:
@@ -134,12 +167,28 @@ def test_duckdb_relation() -> None:
     assert xml == ref
 
 
-def test_duckdb_nulls_and_a_decimal_that_has_to_be_cast() -> None:
+def test_duckdb_nulls() -> None:
     con = duckdb.connect()
     cols = ax.columns(con.sql("select * from (values ('a', 1.5::double), (NULL, NULL)) v(k, x)"))
     assert "1 null" in repr(cols["k"]) and "1 null" in repr(cols["x"])
-    with pytest.raises(ax.UnsupportedTypeError, match="DECIMAL|::DOUBLE"):
-        ax.columns(con.sql("select 1.5 as x"))
+
+
+def test_duckdb_decimals_and_hugeints_need_no_cast() -> None:
+    """DuckDB types literals as DECIMAL and sums of integers as HUGEINT (a 128-bit decimal in Arrow): both are read."""
+    con = duckdb.connect()
+    cols = ax.columns(con.sql("select 1500.50 as price, sum(i) as total, avg(i) as mean, (i * 2.5) as scaled from range(5) t(i) group by i order by i"))
+    assert cols["price"].type == "double" and cols["total"].type == "int64" and cols["scaled"].type == "double"
+    xml = ax.Cellset(
+        "C", [ax.CellValues(cols["price"], "0"), ax.CellValues(cols["total"], "0")],
+        ax.TupleAxis.from_tuples([[MS[0]], [MS[1]]]), ax.LevelAxis(M, ax.columns(con.sql("select 'k' || i::varchar as k from range(5) t(i)"))["k"]),
+    ).to_xml().decode()  # fmt: skip
+    assert '<Value xsi:type="xsd:double">1500.5</Value>' in xml and '<Value xsi:type="xsd:int">4</Value>' in xml
+
+
+def test_duckdb_a_sum_too_big_for_int64_is_a_double() -> None:
+    con = duckdb.connect()
+    cols = ax.columns(con.sql("select (9223372036854775807::hugeint * 4) as big, 1::hugeint as small"))
+    assert cols["big"].type == "double" and cols["small"].type == "int64"
 
 
 def test_duckdb_more_than_one_batch() -> None:
