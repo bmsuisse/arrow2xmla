@@ -312,6 +312,28 @@ fn level_pieces(m: &Member, props: &[MemberProp]) -> (Vec<Piece>, Vec<Piece>) {
     (head, tail)
 }
 
+/// A text as XML text into `buf` when it needs it (with `]` doubled for a key); the text itself when it does not.
+#[inline]
+fn xml_text<'t>(text: &'t [u8], buf: &'t mut Vec<u8>, double_brackets: bool) -> &'t [u8] {
+    let (special, bracket) = classify(text);
+    if !special && !(bracket && double_brackets) {
+        return text;
+    }
+    buf.clear();
+    if double_brackets && bracket {
+        // `]` is not special to XML: each run between two `]` is escaped as it is
+        for (n, part) in text.split(|&b| b == b']').enumerate() {
+            if n > 0 {
+                buf.extend_from_slice(b"]]");
+            }
+            escape_bytes_into(buf, part);
+        }
+    } else {
+        escape_bytes_into(buf, text);
+    }
+    buf
+}
+
 /// What a text needs to become XML text: nothing, escaping, and whether it holds `]` (doubled in a key).
 #[inline]
 fn classify(t: &[u8]) -> (bool, bool) {
@@ -358,13 +380,17 @@ fn write_axis(w: &mut Writer<'_>, n: usize, axis: &Axis<'_>) -> Result<(), Error
             let (head, tail) = level_pieces(&l.template, &axis.properties);
             let mut blank = Vec::new();
             escape_into(&mut blank, &l.blank_caption);
-            let keys = l.keys;
+            let (keys, captions) = (l.keys, l.captions);
             w.parallel(keys.len(), 1, LEVEL_CHUNK_ROWS, 450, |range, out| {
                 let (mut key, mut cap) = (Vec::new(), Vec::new());
                 for i in range {
-                    let (key_b, cap_b): (&[u8], &[u8]) = match keys.text(i) {
-                        None => (b"", &blank),
-                        Some(text) => match classify(text) {
+                    let (key_b, cap_b): (&[u8], &[u8]) = match (keys.text(i), captions) {
+                        (key_text, Some(captions)) => (
+                            key_text.map_or(&b""[..], |t| xml_text(t, &mut key, true)),
+                            captions.text(i).map_or(&blank[..], |t| xml_text(t, &mut cap, false)),
+                        ),
+                        (None, None) => (b"", &blank),
+                        (Some(text), None) => match classify(text) {
                             (false, false) => (text, text),
                             (special, bracket) => {
                                 cap.clear();
@@ -529,7 +555,7 @@ fn write_cells(w: &mut Writer<'_>, cs: &Cellset<'_>) -> Result<(), Error> {
                         e
                     }
                     CellProp::Language => cs.language.to_string().into_bytes(),
-                    _ => continue,
+                    _ => continue, // declared in the header only
                 };
                 lit(&mut tail, &format!("<{}>", p.element()));
                 tail.extend_from_slice(&value);
@@ -589,6 +615,15 @@ impl Cellset<'_> {
                     l.keys.check()?;
                     if !l.keys.is_text() {
                         return Err(Error::Unsupported("a level's keys must be a text array".into()));
+                    }
+                    if let Some(c) = &l.captions {
+                        c.check()?;
+                        if !c.is_text() {
+                            return Err(Error::Unsupported("a level's captions must be a text array".into()));
+                        }
+                        if c.len() != l.keys.len() {
+                            return Err(Error::Invalid(format!("a level's captions ({}) are not as many as its keys ({})", c.len(), l.keys.len())));
+                        }
                     }
                 }
                 AxisSource::Tuples(t) => {

@@ -70,6 +70,8 @@ class LightAxis:
     sample: Member
     all_member: Member | None
     values: list[object]
+    captions: list[object] | None = None  # one per value; None: each value is its own caption
+    blank_caption: str = "(blank)"
 
 
 @dataclass
@@ -180,7 +182,11 @@ def _light_chunks(axis: LightAxis, props: tuple[str, ...]) -> Iterator[str]:
         all_head, all_tail = _member_parts(axis.all_member, props)
         out.append(f"<Tuple>{all_head}{info}{all_tail}</Tuple>")
     for i, v in enumerate(axis.values):
-        key, caption = ("", "(blank)") if v is None else (str(v), str(v))
+        key = "" if v is None else str(v)
+        if axis.captions is None:
+            caption = axis.blank_caption if v is None else str(v)
+        else:  # the key as given, the caption from its own column (null: the blank caption)
+            caption = axis.blank_caption if axis.captions[i] is None else str(axis.captions[i])
         out.append(
             template.replace(_INFO, "0" if i == 0 else str(_SAME_PARENT))
             .replace(_KEY, _esc(key.replace("]", "]]")))

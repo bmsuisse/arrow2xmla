@@ -68,8 +68,10 @@ This is what `Cellset.to_xml()` writes. How the pieces line up:
 ## Open points: not verified against real Excel
 
 - **Cell properties.** Excel asks `CELL PROPERTIES VALUE, FORMAT_STRING, LANGUAGE, BACK_COLOR, FORE_COLOR, FONT_FLAGS`.
-  `arrow2xmla` writes only `VALUE`, `FORMAT_STRING` and `LANGUAGE` and refuses the others, so a server must declare what
-  it writes. Whether Excel is content with a `CellInfo` that lists fewer than it asked for is expected but untested here.
+  `arrow2xmla` writes `VALUE`, `FORMAT_STRING` and `LANGUAGE` in each cell and can declare the others
+  (`BACK_COLOR`, `FORE_COLOR`, `FONT_FLAGS`, ...) in `CellInfo` without writing them, in the order they are listed: a
+  server lists what the statement asked for, and the client gets the declaration and the defaults. Whether Excel renders
+  such an answer as it would real colours and fonts is expected but untested here; a name in neither group is refused.
 - **Excel for Windows only.** Real Excel cannot be run in this repository's CI. The tests replay the recordings against a
   mock endpoint (`tests/e2e`) and read the answers the way a client does; that proves the answers are well-formed and
   carry the data, not that Excel renders them.
