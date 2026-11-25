@@ -98,9 +98,11 @@ cols = ax.columns(ordered)
 straight = build(cols["customer"].slice(1), cols).to_xml()
 print(f"straight : {len(straight):,} bytes of XMLA from `columns(result)` and `slice(1)`")
 
-# 2. reshaping, for a raw result: register it in DuckDB (it can be read as often as the SQL needs), sort it, add the All row
+# 2. reshaping, for a raw result: copy it into a DuckDB table once (older DuckDB reads a registered Arrow stream only once,
+#    and the two queries below read it twice), then sort it and add the All row in SQL
 con = duckdb.connect()
-con.register("result", raw)
+con.register("raw_result", raw)
+con.execute("create table result as select * from raw_result")
 keys = ax.columns(con.sql("select customer from result order by customer nulls last"))["customer"]
 cells = ax.columns(con.sql("""
     select revenue, orders from (

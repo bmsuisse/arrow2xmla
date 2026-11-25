@@ -62,11 +62,12 @@ def test_an_arrowbricks_table_reads_like_the_pyarrow_table_of_the_same_data() ->
     assert b"Initech &amp; Co" in cellset(ours)
 
 
-def test_duckdb_registers_an_arrowbricks_table_twice_and_reads_it_repeatedly() -> None:
+def test_an_arrowbricks_table_copied_into_duckdb_is_read_repeatedly_on_every_duckdb() -> None:
+    """DuckDB before 1.5 reads a registered Arrow stream once; the example copies it into a table, which any version rereads."""
     result = read_ipc_stream(DATA)
     con = duckdb.connect()
-    con.register("result", result)
-    con.register("result", result)
+    con.register("raw_result", result)
+    con.execute("create table result as select * from raw_result")
     first = con.sql("select count(*), sum(orders), count(customer) from result").fetchall()
     assert first == con.sql("select count(*), sum(orders), count(customer) from result").fetchall()
     assert first[0][0] == 26 and first[0][2] == 25  # the NULL customer is there
