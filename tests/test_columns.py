@@ -154,6 +154,69 @@ def test_a_decimal_array_given_directly_is_read_like_one_from_columns() -> None:
         ax.Cellset("C", [ax.CellValues(pa.array([1.0, 2.0, 3.0]), "0")], ax.LevelAxis(M, t["v"].combine_chunks())).to_xml()
 
 
+def _col(values, typ):
+    return ax.columns(pa.table({"v": pa.array(values, typ)}))["v"]
+
+
+def _cells_of(col) -> list:
+    """What a column holds, read back through a one-column cellset (None for an empty cell)."""
+    import re
+
+    n = len(col)
+    keys = ax.columns(pa.table({"k": pa.array([f"k{i}" for i in range(n)], pa.string())}))["k"]
+    xml = ax.Cellset("C", [ax.CellValues(col, "0")], ax.LevelAxis(M, keys)).to_xml().decode()
+    found = {int(o): v for o, v in re.findall(r'<Cell CellOrdinal="(\d+)"><Value xsi:type="[^"]+">([^<]*)</Value>', xml)}
+    return [found.get(i) for i in range(n)]
+
+
+@pytest.mark.parametrize(
+    ("typ", "values"),
+    [
+        (pa.float64(), [1.5, None, 3.5, 4.5, None, 6.5]), (pa.int64(), [10, 20, None, 40, 50, 60]), (pa.int8(), [1, 2, 3, 4, 5, 6]),
+        (pa.uint32(), [None, 2, 3, 4, 5, None]), (pa.float32(), [0.5, 1.5, 2.5, 3.5, 4.5, 5.5]),
+        (pa.string(), ["a", None, "ü&<", "", "dd", "eeé"]), (pa.large_string(), ["x", "yy", "", None, "zzz", "w"]),
+    ],
+)  # fmt: skip
+@pytest.mark.parametrize(("offset", "length"), [(0, None), (1, None), (2, 3), (0, 0), (6, None), (3, 3), (5, 1)])
+def test_a_slice_is_the_rows_it_names(typ: pa.DataType, values: list, offset: int, length: int | None) -> None:
+    col = _col(values, typ)
+    part = col.slice(offset, length)
+    end = len(values) if length is None else offset + length
+    assert len(part) == end - offset and part.type == col.type
+    assert _cells_of(part) == _cells_of(col)[offset:end]
+    assert "null" in repr(part) or all(v is not None for v in values[offset:end])
+
+
+def test_a_slice_of_a_slice_and_the_original_is_untouched() -> None:
+    col = _col([1, 2, None, 4, 5], pa.int64())
+    twice = col.slice(1).slice(1, 2)
+    assert _cells_of(twice) == ["2", None] or _cells_of(twice) == [None, "4"]
+    assert _cells_of(twice) == _cells_of(col)[2:4]
+    assert len(col) == 5 and _cells_of(col) == ["1", "2", None, "4", "5"]
+
+
+@pytest.mark.parametrize(("offset", "length"), [(-1, None), (7, None), (0, 7), (3, -1), (4, 3), (2**62, None)])
+def test_a_slice_out_of_range_is_refused(offset: int, length: int | None) -> None:
+    with pytest.raises(ax.CellsetError, match="out of range"):
+        _col([1, 2, 3, 4, 5, 6], pa.int64()).slice(offset, length)
+
+
+def test_one_result_feeds_the_names_and_the_cells() -> None:
+    """A result whose first row is the All row: its names without that row are the keys, its values are the cells."""
+    t = pa.table({"k": pa.array([None, "b", "a", None], pa.string()), "v": pa.array([10.0, 3.5, 2.5, None])})
+    cols = ax.columns(t)
+    one = ax.Cellset(
+        "C", [ax.CellValues(cols["v"], "0")], ax.TupleAxis.from_tuples([[MS[0]]]), ax.LevelAxis(M, cols["k"].slice(1), all=ALL_MEMBER)
+    ).to_xml()
+    two = ax.Cellset(
+        "C", [ax.CellValues(t["v"].combine_chunks(), "0")], ax.TupleAxis.from_tuples([[MS[0]]]), ax.LevelAxis(M, pa.array(["b", "a", None]), all=ALL_MEMBER)
+    ).to_xml()
+    assert one == two
+
+
+ALL_MEMBER = ax.Member("[H]", "[H].[(All)]", 0, "[H].[All]", "All", member_type=ax.MemberType.ALL)
+
+
 def test_a_column_is_reusable_and_read_only() -> None:
     col = ax.columns(table(50))["b"]
     cs = ax.Cellset("C", [ax.CellValues(col, "0")], ax.LevelAxis(M, ax.columns(table(50))["k"]))

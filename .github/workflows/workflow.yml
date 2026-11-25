@@ -114,9 +114,11 @@ jobs:
           path: dist
       - run: |
           if [ "${{ matrix.duckdb }}" = latest ]; then python -m pip install duckdb; else python -m pip install "duckdb==${{ matrix.duckdb }}"; fi
+          python -m pip install arrowbricks
           python -m pip install --no-index --find-links dist arrow2xmla
           python examples/quickstart.py
           EXAMPLE_ROWS=20000 python examples/streaming.py
+          python examples/databricks.py
 
   olap4j:
     # an independent client (olap4j's XMLA driver, Java) and the XMLA schema read our answers from a mock endpoint

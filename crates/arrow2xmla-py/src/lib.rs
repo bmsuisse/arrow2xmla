@@ -327,6 +327,62 @@ impl ArrowColumn {
         let nulls = self.validity.as_ref().map_or(0, |_| (0..self.len).filter(|&i| !self.array().is_valid(i)).count());
         format!("<ArrowColumn {} x {}, {} null>", self.type_name(), self.len, nulls)
     }
+
+    /// A copy of the rows `offset .. offset + length` (to the end when `length` is None): one result can then feed the
+    /// members of an axis and the cells, e.g. the names without the All row that comes first in the cells.
+    #[pyo3(signature = (offset, length=None))]
+    fn slice(&self, offset: i64, length: Option<i64>) -> PyResult<ArrowColumn> {
+        let range_error = || CellsetError::new_err(format!("rows {offset}.. of a column of {} rows: out of range", self.len));
+        let start = usize::try_from(offset).map_err(|_| range_error())?;
+        let end = match length {
+            Some(l) => start.checked_add(usize::try_from(l).map_err(|_| range_error())?).ok_or_else(range_error)?,
+            None => self.len,
+        };
+        if start > self.len || end > self.len {
+            return Err(range_error());
+        }
+        macro_rules! part {
+            ($v:ident, $variant:ident) => {
+                Owned::$variant($v[start..end].to_vec())
+            };
+        }
+        let owned = match &self.owned {
+            Owned::F64(v) => part!(v, F64),
+            Owned::F32(v) => part!(v, F32),
+            Owned::F16(v) => part!(v, F16),
+            Owned::I64(v) => part!(v, I64),
+            Owned::I32(v) => part!(v, I32),
+            Owned::I16(v) => part!(v, I16),
+            Owned::I8(v) => part!(v, I8),
+            Owned::U64(v) => part!(v, U64),
+            Owned::U32(v) => part!(v, U32),
+            Owned::U16(v) => part!(v, U16),
+            Owned::U8(v) => part!(v, U8),
+            Owned::Text { offsets, data } => {
+                let from = offsets[start];
+                let to = offsets[end];
+                Owned::Text {
+                    offsets: offsets[start..=end].iter().map(|o| o - from).collect(),
+                    data: data[usize::try_from(from).expect("offsets are not negative")..usize::try_from(to).expect("offsets are not negative")].to_vec(),
+                }
+            }
+        };
+        // the validity of the range, re-based to bit 0; none when the range holds no null
+        let validity = self.validity.as_ref().and_then(|bits| {
+            let valid = |i: usize| bits[i >> 3] >> (i & 7) & 1 == 1;
+            if (start..end).all(valid) {
+                return None;
+            }
+            let mut out = vec![0u8; (end - start).div_ceil(8)];
+            for (k, i) in (start..end).enumerate() {
+                if valid(i) {
+                    out[k >> 3] |= 1 << (k & 7);
+                }
+            }
+            Some(out)
+        });
+        Ok(ArrowColumn { owned, validity, len: end - start })
+    }
 }
 
 /// A decimal column (`d:precision,scale[,bits]`): its unscaled integers, converted when the column is finished.

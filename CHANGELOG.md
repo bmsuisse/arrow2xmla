@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **`ArrowColumn.slice(offset, length=None)`**: a copy of some rows of a column. One result can now give both the
+  members and the cells, e.g. `cols["customer"].slice(1)` for a result whose first row is the All row.
+- **Sample: Databricks.** `examples/databricks.py` takes a query result from `arrowbricks` straight into `columns()`: one
+  result with the All row first and the customers sorted (the warehouse sorts), the keys by `slice(1)`; or through DuckDB when
+  the result is not in that order. It queries a warehouse when `DATABRICKS_HOST`,
+  `DATABRICKS_WAREHOUSE_ID` and `DATABRICKS_TOKEN` are set, otherwise it rebuilds a small result from
+  `examples/data/sales.arrows`. Tested and run in CI.
+
 ## 0.3.0
 
 - **Removed:** the optional `pyarrow` extra (`pip install arrow2xmla[pyarrow]`): nothing in the package needs it.

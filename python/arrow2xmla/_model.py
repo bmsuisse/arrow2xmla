@@ -72,7 +72,8 @@ def columns(table: Any) -> dict[str, Any]:
 
     The batches are copied once into one array per column. Types: floats, integers, text, and decimals (DuckDB's `DECIMAL` and
     `HUGEINT`): a decimal is read as an int64 when its scale is 0 and every value fits, else as a double. Anything else (dates,
-    booleans, 256-bit decimals, ...) raises `UnsupportedTypeError` naming the column: cast it in the query."""
+    booleans, 256-bit decimals, ...) raises `UnsupportedTypeError` naming the column: cast it in the query.
+    A column's `slice(offset, length=None)` is a copy of some of its rows, e.g. `columns(t)["name"].slice(1)` for the keys of a result whose first row is the All row."""
     from arrow2xmla import _native
 
     if not hasattr(table, "__arrow_c_stream__"):

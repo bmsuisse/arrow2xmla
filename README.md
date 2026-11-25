@@ -134,7 +134,8 @@ match request.call:
 `ax.columns(...)` takes the result of any query, with no casts: DuckDB's `DECIMAL` (what `sum(amount)` and decimal literals are)
 is read as a double, and a whole-number decimal or `HUGEINT` (a sum of integers) as an int64 when it fits. The same works with
 polars (`ax.columns(df)`) and pyarrow (`ax.columns(table)`), and arrays you already hold (`pa.array([...])`) go straight into
-`CellValues`.
+`CellValues`. `column.slice(offset, length=None)` is a copy of some rows of a column (0.4 ms for 500 000 names), so one result can give
+both the members and the cells (see From Databricks below).
 
 Tested with DuckDB 1.1.3, 1.2.2, 1.3.2, 1.4.4, 1.5.2 and 2.0.1 (CI runs the examples against several of them). Older DuckDB does not export Arrow streams.
 
@@ -145,8 +146,79 @@ Each runs as it is with `uv run --with duckdb python examples/<name>.py`:
 - [`examples/quickstart.py`](examples/quickstart.py): a pivot answer from a DuckDB query, and a parsed request.
 - [`examples/streaming.py`](examples/streaming.py): a million customers written with `write_to` and `iter_xml`, with the time
   and the memory it takes (`EXAMPLE_ROWS=20000` for a quick run).
+- [`examples/databricks.py`](examples/databricks.py): a Databricks result from arrowbricks, straight into `columns()` and
+  reshaped through DuckDB (`--with arrowbricks`; offline from a small Arrow file when no warehouse is configured).
 - [`examples/server.py`](examples/server.py): a complete XMLA endpoint over the standard library's `http.server`
   (`python examples/server.py --port 8000`): sessions, the Discover rowsets, a streamed pivot, faults.
+
+### From Databricks (arrowbricks)
+
+[arrowbricks](https://pypi.org/project/arrowbricks/) runs SQL on a Databricks warehouse and returns Arrow data that exports
+the Arrow stream protocol, so a result goes straight into `columns()`. This is [`examples/databricks.py`](examples/databricks.py)
+(`uv run --with duckdb --with arrowbricks python examples/databricks.py`), shortened.
+
+**Straight: one result, no other tool.** The warehouse sorts: the query returns the All row first (`customer` NULL, the
+totals), then the customers by name, NULL last. The sort runs in Databricks, not here, so this path needs the query to return
+the rows in that order.
+
+```python
+import asyncio, os
+import arrow2xmla as ax
+from arrowbricks import connect
+
+async def run(sql):
+    async with connect(host=os.environ["DATABRICKS_HOST"], warehouse_id=os.environ["DATABRICKS_WAREHOUSE_ID"], token=os.environ["DATABRICKS_TOKEN"]) as conn:
+        cursor = conn.cursor()
+        await cursor.execute(sql)
+        return await cursor.fetchall_arrow()
+
+result = asyncio.run(run("""
+    with t as (select customer, sum(amount) as revenue, count(*) as orders from sales.orders group by customer)
+    select customer, revenue, orders from (
+        select 0 as k, cast(null as string) as customer, sum(revenue) as revenue, sum(orders) as orders from t
+        union all select 1, customer, revenue, orders from t
+    ) order by k, customer nulls last"""))
+
+cols = ax.columns(result)
+keys = cols["customer"].slice(1)           # the members: every row but the All row
+cells = [cols["revenue"], cols["orders"]]  # the values: their first row is the All row
+# LevelAxis(customer_member, keys, all=all_member), CellValues(cells[0]), ... -> Cellset -> to_xml() / write_to(), as in the quick start
+```
+
+**Reshaping: a result that is not in that order.** Register it in DuckDB, sort and add the All row in SQL, and read the columns
+from the query:
+
+```python
+import duckdb
+
+con = duckdb.connect()
+con.register("result", raw)  # raw: an arrowbricks result, one row per customer
+keys = ax.columns(con.sql("select customer from result order by customer nulls last"))["customer"]
+cells = ax.columns(con.sql("""select revenue, orders from (
+    select 0 as k, null as customer, sum(revenue) as revenue, sum(orders) as orders from result
+    union all select 1, customer, revenue, orders from result) order by k, customer nulls last"""))
+```
+
+Both write the same cellset. With `DATABRICKS_HOST`, `DATABRICKS_WAREHOUSE_ID` and `DATABRICKS_TOKEN` set the example queries
+the warehouse; without them it rebuilds small results from `examples/data/*.arrows` and runs the same code. A Databricks
+result reads like any other: text, integers, floats and decimals (a `sum` of a `DECIMAL`) are read as they are, but
+timestamps, dates and booleans raise `UnsupportedTypeError`, so cast them in the query (`cast(day as string)`).
+
+Measured with the result already in memory as an arrowbricks table (`benchmarks/arrowbricks_bench.py`: Apple M6, 12 cores,
+Python 3.14, DuckDB 2.0.1; best of 7 runs, 3 for the 3 000 000 rows; written to a counting sink). Not in the numbers: the
+Databricks query and the download of the result, and sending the bytes to the client.
+
+| Customers × 3 measures | Answer | Route | Time | Throughput |
+|---|---:|---|---:|---:|
+| 500 000 | 326 MB | straight: `columns()` → `slice(1)` → `write_to` | 27 to 30 ms | 11 to 12 GB/s |
+| 500 000 | 326 MB | reshaping: register in DuckDB → SQL → `columns()` → `write_to` | 65 to 78 ms | 4.2 to 5.1 GB/s |
+| 3 000 000 | 2.0 GB | straight | 150 ms | 13.1 GB/s |
+| 3 000 000 | 2.0 GB | reshaping | 396 ms | 5.0 GB/s |
+
+In the straight route at 500 000 rows, `columns()` takes 5 to 8 ms, the `slice` under 1 ms and the writing about 21 to 23 ms;
+run to run the times vary by a few milliseconds. Reproduce with
+`uv run --with duckdb --with arrowbricks --with pyarrow python benchmarks/arrowbricks_bench.py --rows 500000 --repeat 7`
+(pyarrow only writes the Arrow IPC bytes of the synthetic result once).
 
 ### In Rust
 
