@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (2026-11-25)
 
 - **Separate member captions.** `LevelAxis(..., captions=...)` (Rust: `LevelAxis::captions`; `from_dict`: `"captions"` in a
   level) takes a text array of the same length as the keys for the captions. The keys are then written as given, only XML-escaped

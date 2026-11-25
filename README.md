@@ -87,7 +87,7 @@ The Rust crate is not published on crates.io; the package is PyPI only. To use t
 (Rust 1.88+):
 
 ```toml
-arrow2xmla = { git = "https://github.com/bmsuisse/arrow2xmla", tag = "v0.3.0" }
+arrow2xmla = { git = "https://github.com/bmsuisse/arrow2xmla", tag = "v0.4.0" }
 ```
 
 ## Quick start
