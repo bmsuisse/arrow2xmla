@@ -3,16 +3,21 @@
 import itertools
 import xml.etree.ElementTree as ET
 
-import pyarrow as pa
+import pytest
 
 import arrow2xmla as ax
+
+duckdb = pytest.importorskip("duckdb", reason="the README server sketch uses DuckDB")
+con = duckdb.connect()
 
 M = ax.Member("[H]", "[H].[L]", 1)
 MEASURE = ax.Member("[Measures]", "[Measures].[ML]", 0, "[Measures].[Revenue]", "Revenue", member_type=ax.MemberType.MEASURE)
 
 
 def run(mdx: str) -> ax.Cellset:
-    return ax.Cellset("Sales", [ax.CellValues(pa.array([1.5, 2.5]), "0.0")], ax.TupleAxis.from_tuples([[MEASURE]]), ax.LevelAxis(M, pa.array(["a", "b"])))
+    cells = ax.columns(con.sql("select * from (values (1.5::double), (2.5::double)) t(v)"))
+    names = ax.columns(con.sql("select * from (values ('a'), ('b')) t(n)"))
+    return ax.Cellset("Sales", [ax.CellValues(cells["v"], "0.0")], ax.TupleAxis.from_tuples([[MEASURE]]), ax.LevelAxis(M, names["n"]))
 
 
 def answer(body: bytes):
@@ -24,7 +29,7 @@ def answer(body: bytes):
     session = "new-id" if request.session.kind is ax.SessionKind.BEGIN else request.session.id
     match request.call:
         case ax.Discover(request_type="MDSCHEMA_CUBES"):
-            rows = ax.Rowset.from_columns({"CUBE_NAME": pa.array(["Sales"]), "CUBE_TYPE": pa.array(["CUBE"])})
+            rows = ax.Rowset.from_columns(ax.columns(con.sql("select 'Sales' as CUBE_NAME, 'CUBE' as CUBE_TYPE")))
             return 200, [ax.Envelope(ax.Method.DISCOVER, session).wrap(rows.to_xml())]
         case ax.Execute(statement=mdx):
             envelope = ax.Envelope(ax.Method.EXECUTE, session)

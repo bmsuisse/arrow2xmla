@@ -82,6 +82,14 @@ fn count(v: i64, what: &str) -> PyResult<usize> {
 }
 
 fn import<'a>(obj: &Bound<'_, PyAny>, keep: &mut Keep) -> PyResult<Array<'a>> {
+    // a column this module read from a stream (`read_stream`) owns its buffers
+    if let Ok(col) = obj.extract::<Py<ArrowColumn>>() {
+        let r: &ArrowColumn = col.get();
+        // SAFETY: the column is frozen and lives as long as `keep` holds it, which outlives every view
+        let r: &'a ArrowColumn = unsafe { &*(r as *const ArrowColumn) };
+        keep.capsules.push(col.into_any());
+        return Ok(r.array());
+    }
     let method = obj.getattr("__arrow_c_array__").map_err(|_| {
         bad(format!(
             "expected an Arrow array (an object with __arrow_c_array__, such as a pyarrow Array), not {}",
@@ -100,6 +108,12 @@ fn import<'a>(obj: &Bound<'_, PyAny>, keep: &mut Keep) -> PyResult<Array<'a>> {
     if schema.release.is_none() || array.release.is_none() {
         return Err(bad("an Arrow array that was already released"));
     }
+    import_raw(schema, array, keep)
+}
+
+/// A view of an array given as C data interface structs (checked as far as the structs show). The buffers are trusted
+/// to be as long as the array says; they must outlive the view.
+fn import_raw<'a>(schema: &ArrowSchema, array: &ArrowArray, keep: &mut Keep) -> PyResult<Array<'a>> {
     if schema.format.is_null() {
         return Err(bad("an Arrow schema without a format"));
     }
@@ -181,6 +195,301 @@ fn import<'a>(obj: &Bound<'_, PyAny>, keep: &mut Keep) -> PyResult<Array<'a>> {
             out = out.with_validity(slice::<u8>(buffers[0], end.div_ceil(8), "validity")?, off);
         }
         Ok(out)
+    }
+}
+
+// A stream of arrays (`__arrow_c_stream__`: a DuckDB relation, a polars Series, a pyarrow Table, ...) read into columns
+// this module owns: the batches are copied into one array per column, so no Arrow library is needed to cut a column out
+// of a table or to combine chunks.
+#[repr(C)]
+struct ArrowArrayStream {
+    get_schema: Option<unsafe extern "C" fn(*mut ArrowArrayStream, *mut ArrowSchema) -> i32>,
+    get_next: Option<unsafe extern "C" fn(*mut ArrowArrayStream, *mut ArrowArray) -> i32>,
+    get_last_error: Option<unsafe extern "C" fn(*mut ArrowArrayStream) -> *const c_char>,
+    release: Option<unsafe extern "C" fn(*mut ArrowArrayStream)>,
+    private_data: *mut c_void,
+}
+
+struct SchemaGuard(ArrowSchema);
+impl Drop for SchemaGuard {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.release {
+            // SAFETY: a schema the producer filled in and has not released
+            unsafe { release(&mut self.0) };
+        }
+    }
+}
+
+struct ArrayGuard(ArrowArray);
+impl Drop for ArrayGuard {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.release {
+            // SAFETY: an array the producer filled in and has not released
+            unsafe { release(&mut self.0) };
+        }
+    }
+}
+
+enum Owned {
+    F64(Vec<f64>),
+    F32(Vec<f32>),
+    F16(Vec<u16>),
+    I64(Vec<i64>),
+    I32(Vec<i32>),
+    I16(Vec<i16>),
+    I8(Vec<i8>),
+    U64(Vec<u64>),
+    U32(Vec<u32>),
+    U16(Vec<u16>),
+    U8(Vec<u8>),
+    Text { offsets: Vec<i64>, data: Vec<u8> },
+}
+
+/// One column read from a stream: Arrow values this module owns (text as `large_string`), usable wherever an Arrow
+/// array is.
+#[pyclass(frozen, module = "arrow2xmla._native")]
+struct ArrowColumn {
+    owned: Owned,
+    validity: Option<Vec<u8>>,
+    len: usize,
+}
+
+impl ArrowColumn {
+    fn array(&self) -> Array<'_> {
+        let values = match &self.owned {
+            Owned::F64(v) => Values::F64(v),
+            Owned::F32(v) => Values::F32(v),
+            Owned::F16(v) => Values::F16(v),
+            Owned::I64(v) => Values::I64(v),
+            Owned::I32(v) => Values::I32(v),
+            Owned::I16(v) => Values::I16(v),
+            Owned::I8(v) => Values::I8(v),
+            Owned::U64(v) => Values::U64(v),
+            Owned::U32(v) => Values::U32(v),
+            Owned::U16(v) => Values::U16(v),
+            Owned::U8(v) => Values::U8(v),
+            Owned::Text { offsets, data } => Values::LargeUtf8 { offsets, data },
+        };
+        let array = Array::new(values);
+        match &self.validity {
+            Some(bits) => array.with_validity(bits, 0),
+            None => array,
+        }
+    }
+
+    fn type_name(&self) -> &'static str {
+        match self.owned {
+            Owned::F64(_) => "double",
+            Owned::F32(_) => "float",
+            Owned::F16(_) => "halffloat",
+            Owned::I64(_) => "int64",
+            Owned::I32(_) => "int32",
+            Owned::I16(_) => "int16",
+            Owned::I8(_) => "int8",
+            Owned::U64(_) => "uint64",
+            Owned::U32(_) => "uint32",
+            Owned::U16(_) => "uint16",
+            Owned::U8(_) => "uint8",
+            Owned::Text { .. } => "large_string",
+        }
+    }
+}
+
+#[pymethods]
+impl ArrowColumn {
+    fn __len__(&self) -> usize {
+        self.len
+    }
+
+    /// The Arrow type, e.g. `double`, `int64`, `large_string`.
+    #[getter]
+    fn r#type(&self) -> &'static str {
+        self.type_name()
+    }
+
+    fn __repr__(&self) -> String {
+        let nulls = self.validity.as_ref().map_or(0, |_| (0..self.len).filter(|&i| !self.array().is_valid(i)).count());
+        format!("<ArrowColumn {} x {}, {} null>", self.type_name(), self.len, nulls)
+    }
+}
+
+/// Copies of one column's batches, appended.
+struct Acc {
+    owned: Owned,
+    valid: Vec<bool>,
+    nulls: bool,
+}
+
+impl Acc {
+    fn new(format: &str, name: &str) -> PyResult<Acc> {
+        let owned = match format {
+            "g" => Owned::F64(vec![]),
+            "f" => Owned::F32(vec![]),
+            "e" => Owned::F16(vec![]),
+            "l" => Owned::I64(vec![]),
+            "i" => Owned::I32(vec![]),
+            "s" => Owned::I16(vec![]),
+            "c" => Owned::I8(vec![]),
+            "L" => Owned::U64(vec![]),
+            "I" => Owned::U32(vec![]),
+            "S" => Owned::U16(vec![]),
+            "C" => Owned::U8(vec![]),
+            "u" | "U" | "vu" => Owned::Text { offsets: vec![0], data: vec![] },
+            other => {
+                let what = if name.is_empty() { "an Arrow array".to_string() } else { format!("column {name:?}") };
+                return Err(UnsupportedTypeError::new_err(format!("{what} has Arrow format {other:?}, which is not supported (floats, integers, text): cast it first (in a query: `x::DOUBLE`, `x::BIGINT`, `x::VARCHAR`)")));
+            }
+        };
+        Ok(Acc { owned, valid: vec![], nulls: false })
+    }
+
+    fn push(&mut self, a: &Array<'_>) {
+        let n = a.len();
+        match (&mut self.owned, a.values) {
+            (Owned::F64(v), Values::F64(s)) => v.extend_from_slice(s),
+            (Owned::F32(v), Values::F32(s)) => v.extend_from_slice(s),
+            (Owned::F16(v), Values::F16(s)) => v.extend_from_slice(s),
+            (Owned::I64(v), Values::I64(s)) => v.extend_from_slice(s),
+            (Owned::I32(v), Values::I32(s)) => v.extend_from_slice(s),
+            (Owned::I16(v), Values::I16(s)) => v.extend_from_slice(s),
+            (Owned::I8(v), Values::I8(s)) => v.extend_from_slice(s),
+            (Owned::U64(v), Values::U64(s)) => v.extend_from_slice(s),
+            (Owned::U32(v), Values::U32(s)) => v.extend_from_slice(s),
+            (Owned::U16(v), Values::U16(s)) => v.extend_from_slice(s),
+            (Owned::U8(v), Values::U8(s)) => v.extend_from_slice(s),
+            (Owned::Text { offsets, data }, _) => {
+                for i in 0..n {
+                    if let Some(t) = a.text(i) {
+                        data.extend_from_slice(t);
+                    }
+                    offsets.push(data.len() as i64);
+                }
+            }
+            _ => unreachable!("the batches of a stream have one type"),
+        }
+        for i in 0..n {
+            let ok = a.is_valid(i);
+            self.nulls |= !ok;
+            self.valid.push(ok);
+        }
+    }
+
+    fn finish(self) -> ArrowColumn {
+        let len = self.valid.len();
+        let validity = self.nulls.then(|| {
+            let mut bits = vec![0u8; len.div_ceil(8)];
+            for (i, ok) in self.valid.iter().enumerate() {
+                if *ok {
+                    bits[i >> 3] |= 1 << (i & 7);
+                }
+            }
+            bits
+        });
+        ArrowColumn { owned: self.owned, validity, len }
+    }
+}
+
+/// `read_stream(obj) -> [(name | None, ArrowColumn)]`: the columns of an Arrow stream. A table (a stream of structs) gives
+/// one entry per column, named; a stream of plain arrays gives one unnamed column.
+#[pyfunction]
+fn read_stream(obj: &Bound<'_, PyAny>) -> PyResult<Vec<(Option<String>, ArrowColumn)>> {
+    let method = obj.getattr("__arrow_c_stream__").map_err(|_| {
+        bad(format!(
+            "expected an Arrow table or stream (an object with __arrow_c_stream__, such as a DuckDB relation or a pyarrow Table), not {}",
+            obj.get_type().name().map_or_else(|_| "this".to_string(), |n| format!("a {n}"))
+        ))
+    })?;
+    let capsule = method.call0()?.cast_into::<PyCapsule>().map_err(|_| bad("__arrow_c_stream__ did not return a capsule"))?;
+    let stream = capsule.pointer_checked(Some(c"arrow_array_stream"))?.as_ptr().cast::<ArrowArrayStream>();
+    // SAFETY: the capsule holds a C stream interface struct (the protocol's contract) and stays alive until the end of
+    // this function; its destructor releases the stream. What the structs show to be wrong is refused.
+    unsafe {
+        let s = &*stream;
+        let (Some(get_schema), Some(get_next)) = (s.get_schema, s.get_next) else {
+            return Err(bad("an Arrow stream without its functions, or one that was already released"));
+        };
+        if s.release.is_none() {
+            return Err(bad("an Arrow stream that was already released"));
+        }
+        let last_error = |stream: *mut ArrowArrayStream| -> String {
+            match (*stream).get_last_error {
+                Some(f) => {
+                    let p = f(stream);
+                    if p.is_null() { "unknown error".into() } else { CStr::from_ptr(p).to_string_lossy().into_owned() }
+                }
+                None => "unknown error".into(),
+            }
+        };
+        let mut schema = SchemaGuard(std::mem::zeroed());
+        if get_schema(stream, &mut schema.0) != 0 {
+            return Err(bad(format!("the Arrow stream failed: {}", last_error(stream))));
+        }
+        if schema.0.format.is_null() {
+            return Err(bad("an Arrow stream schema without a format"));
+        }
+        let format = CStr::from_ptr(schema.0.format).to_str().map_err(|_| bad("an Arrow format that is not text"))?;
+        let is_table = format == "+s";
+        let columns = if is_table { count(schema.0.n_children, "child count")? } else { 1 };
+        if is_table && columns > 0 && schema.0.children.is_null() {
+            return Err(bad("an Arrow table schema without its children"));
+        }
+        let child_schema = |j: usize| -> &ArrowSchema { if is_table { &**schema.0.children.add(j) } else { &schema.0 } };
+        let mut names: Vec<Option<String>> = vec![];
+        let mut accs: Vec<Acc> = vec![];
+        for j in 0..columns {
+            let cs = child_schema(j);
+            if cs.format.is_null() {
+                return Err(bad("an Arrow column without a format"));
+            }
+            let name = if is_table && !cs.name.is_null() { CStr::from_ptr(cs.name).to_string_lossy().into_owned() } else { String::new() };
+            let f = CStr::from_ptr(cs.format).to_str().map_err(|_| bad("an Arrow format that is not text"))?;
+            if !cs.dictionary.is_null() {
+                let what = if name.is_empty() { "an Arrow array".to_string() } else { format!("column {name:?}") };
+                return Err(UnsupportedTypeError::new_err(format!("{what} is dictionary-encoded, which is not supported: cast it to its plain type first (in a query: `x::VARCHAR`)")));
+            }
+            accs.push(Acc::new(f, &name)?);
+            names.push(is_table.then_some(name));
+        }
+        let mut keep = Keep::default();
+        loop {
+            let mut batch = ArrayGuard(std::mem::zeroed());
+            if get_next(stream, &mut batch.0) != 0 {
+                return Err(bad(format!("the Arrow stream failed: {}", last_error(stream))));
+            }
+            if batch.0.release.is_none() {
+                break; // the end of the stream
+            }
+            if is_table {
+                if count(batch.0.n_children, "child count")? != columns || (columns > 0 && batch.0.children.is_null()) {
+                    return Err(bad("an Arrow table batch that does not match its schema"));
+                }
+                if batch.0.null_count != 0 {
+                    return Err(bad("an Arrow table with null rows is not supported"));
+                }
+            }
+            for (j, acc) in accs.iter_mut().enumerate() {
+                let array = if is_table {
+                    let child = *batch.0.children.add(j);
+                    if child.is_null() {
+                        return Err(bad("an Arrow table batch without one of its columns"));
+                    }
+                    // the offset of a struct applies to its children
+                    let mut view = std::ptr::read(child);
+                    view.offset = view.offset.checked_add(batch.0.offset).ok_or_else(|| bad("an Arrow array too long"))?;
+                    view.length = batch.0.length;
+                    import_raw(child_schema(j), &view, &mut keep)?
+                } else {
+                    if batch.0.release.is_none() {
+                        return Err(bad("an Arrow array that was already released"));
+                    }
+                    import_raw(child_schema(j), &batch.0, &mut keep)?
+                };
+                array.check().map_err(|e| bad(e.to_string()))?;
+                acc.push(&array);
+            }
+        }
+        drop(keep);
+        Ok(names.into_iter().zip(accs.into_iter().map(Acc::finish)).collect())
     }
 }
 
@@ -436,6 +745,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cellset_xml, m)?)?;
     #[cfg(feature = "request")]
     m.add("DEFAULT_MAX_REQUEST", arrow2xmla::DEFAULT_MAX_REQUEST)?;
+    m.add_class::<ArrowColumn>()?;
+    m.add_function(wrap_pyfunction!(read_stream, m)?)?;
     m.add_function(wrap_pyfunction!(cellset_write, m)?)?;
     m.add_function(wrap_pyfunction!(rowset_xml, m)?)?;
     m.add_function(wrap_pyfunction!(envelope, m)?)?;

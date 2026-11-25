@@ -47,19 +47,42 @@ class CellProperty(str, Enum):
 
 
 def _plain(x: Any) -> Any:
-    """One Arrow array: as it is, or a chunked array combined."""
-    if hasattr(x, "__arrow_c_array__"):
-        return x
-    if hasattr(x, "combine_chunks"):
-        return x.combine_chunks()
-    if hasattr(x, "__arrow_c_stream__"):
-        try:
-            import pyarrow as pa
+    """One Arrow array: as it is, a column read from a stream, or a chunked array combined."""
+    from arrow2xmla import _native
 
-            return pa.chunked_array(x).combine_chunks()
-        except ImportError:
-            raise CellsetError("an Arrow stream needs pyarrow to be combined into an array: pass an array (.to_arrow())") from None
-    raise TypeError(f"expected an Arrow array (something with __arrow_c_array__), not {type(x).__name__}")
+    if isinstance(x, _native.ArrowColumn) or hasattr(x, "__arrow_c_array__"):
+        return x
+    if hasattr(x, "combine_chunks"):  # a pyarrow ChunkedArray (a Table has the method too, and combines to a Table)
+        combined = x.combine_chunks()
+        if hasattr(combined, "__arrow_c_array__"):
+            return combined
+    if hasattr(x, "__arrow_c_stream__"):  # a polars Series, a one-column stream: read here, no Arrow library needed
+        columns = _native.read_stream(x)
+        if len(columns) != 1 or columns[0][0] is not None:
+            raise CellsetError("this is a table, not one column: take a column of it with `columns(table)[name]`")
+        return columns[0][1]
+    raise TypeError(f"expected an Arrow array (something with __arrow_c_array__ or __arrow_c_stream__), not {type(x).__name__}")
+
+
+def columns(table: Any) -> dict[str, Any]:
+    """The columns of an Arrow table or stream by name, ready for `CellValues`, `LevelAxis` and `Rowset`. No Arrow library
+    is needed: anything that exports `__arrow_c_stream__` works (a DuckDB relation, a polars DataFrame, a pyarrow Table).
+
+        columns(duckdb.sql("select name, sum(x)::DOUBLE as total from t group by name"))["total"]
+
+    The batches are copied once into one array per column. Types: floats, integers and text; anything else (decimals, dates,
+    booleans, ...) raises `UnsupportedTypeError`: cast it in the query."""
+    from arrow2xmla import _native
+
+    if not hasattr(table, "__arrow_c_stream__"):
+        raise TypeError(f"expected an Arrow table or stream (something with __arrow_c_stream__), not {type(table).__name__}")
+    read = _native.read_stream(table)
+    if any(name is None for name, _ in read):
+        raise CellsetError("this is one column, not a table: use it as it is")
+    names = [name for name, _ in read]
+    if len(set(names)) != len(names):
+        raise CellsetError("the table has two columns of one name: name them apart")
+    return {name: column for name, column in read}
 
 
 def _enums(kind: type[Enum], items: Any, what: str, one: str) -> tuple[Any, ...]:

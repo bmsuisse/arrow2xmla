@@ -59,8 +59,9 @@ Arrow crates in it: arrays are read through the Arrow C interface.
 pip install arrow2xmla
 ```
 
-Python 3.10+, one `abi3` wheel per platform (Linux, macOS, Windows). `pyarrow` is optional: any library that exports the
-Arrow PyCapsule interface works (`pyarrow`, `nanoarrow`, ...; a `polars` Series goes through `pyarrow`, or `.to_arrow()` it first).
+Python 3.10+, one `abi3` wheel per platform (Linux, macOS, Windows). **No Arrow library is needed.** Data comes in through the
+Arrow PyCapsule interface: `columns(table)` reads the columns of anything that exports `__arrow_c_stream__` (a DuckDB relation, a
+polars DataFrame, a pyarrow Table), and an array that exports `__arrow_c_array__` (pyarrow, nanoarrow, ...) is read in place.
 
 The Rust crate is not published on crates.io; the package is PyPI only. To use the crate from Rust, depend on it from git
 (Rust 1.88+):
@@ -71,29 +72,36 @@ arrow2xmla = { git = "https://github.com/bmsuisse/arrow2xmla", tag = "v0.2.0" }
 
 ## Quick start
 
-Abridged from [`examples/quickstart.py`](examples/quickstart.py), which runs as it is (the snippet leaves out the request body).
+With DuckDB, no pyarrow. This is [`examples/quickstart.py`](examples/quickstart.py), which runs as it is
+(`uv run --with duckdb python examples/quickstart.py`); the snippet shortens its data and leaves out the request body.
 
 ```python
-import pyarrow as pa
+import duckdb
+import arrow2xmla as ax
 from arrow2xmla import CellValues, Cellset, Discover, Execute, LevelAxis, Member, MemberProperty, MemberType, TupleAxis, parse_request
 
-# the rows: one member per customer, read straight from an Arrow text column (nothing is built per value)
-customers = pa.array(["Acme", "Globex", None, "Initech & Co"])
+con = duckdb.connect()
+con.sql("create table orders as select * from (values ('Acme', 1000.5), ('Acme', 500.0), ('Globex', 920.0), (NULL, 77.25)) t(customer, amount)")
+by_customer = "select customer, sum(amount)::double as revenue, count(*)::bigint as orders from orders group by customer"
+
+# the rows of the pivot: one member per customer, read from the result of a query (NULL is the blank member)
+customers = ax.columns(con.sql(f"select customer from ({by_customer}) order by customer nulls last"))["customer"]
+# the cells: the All row first, then the customers in the same order
+cells = ax.columns(con.sql(f"""
+    select revenue, orders from (
+        select 0 as k, null as customer, sum(revenue) as revenue, sum(orders)::bigint as orders from ({by_customer})
+        union all select 1, customer, revenue, orders from ({by_customer})
+    ) order by k, customer nulls last"""))
+
 customer = Member("[Customer].[Name]", "[Customer].[Name].[Name]", 1, parent_unique_name="[Customer].[Name].[All]")
 all_customers = Member("[Customer].[Name]", "[Customer].[Name].[(All)]", 0, "[Customer].[Name].[All]", "All", member_type=MemberType.ALL)
-
-# the columns: two measures, listed once
 measure = lambda name: Member("[Measures]", "[Measures].[MeasuresLevel]", 0, f"[Measures].[{name}]", name, member_type=MemberType.MEASURE)
 
 cellset = Cellset(
     cube="Sales",
     columns_axis=TupleAxis.from_tuples([[measure("Revenue")], [measure("Orders")]]),
     rows_axis=LevelAxis(customer, customers, all=all_customers, properties=[MemberProperty.MEMBER_CAPTION]),
-    # one array per column of cells, in the order of the columns axis; a null is an empty cell
-    values=[
-        CellValues(pa.array([1500.5, 920.0, None, 77.25, 12.0]), "#,##0.00"),  # the All row, then the customers
-        CellValues(pa.array([30, 12, 1, 4, 2]), "0"),
-    ],
+    values=[CellValues(cells["revenue"], "#,##0.00"), CellValues(cells["orders"], "0")],  # one per column of the pivot
 )
 xml = cellset.to_xml()          # bytes: an XMLA MDDataset, for the body of an Execute response
 
@@ -102,6 +110,10 @@ match request.call:
     case Execute(statement=mdx): ...
     case Discover(request_type=kind): ...
 ```
+
+`ax.columns(...)` takes the result of any query. DuckDB types literals and sums as `DECIMAL` or `HUGEINT`, which are not written: cast
+them in the query (`::DOUBLE`, `::BIGINT`), as above; the error says which column. The same works with polars
+(`ax.columns(df)`) and pyarrow (`ax.columns(table)`), and arrays you already hold (`pa.array([...])`) go straight into `CellValues`.
 
 ### In Rust
 
@@ -126,8 +138,10 @@ answers with is up to it. This is the shape of one (the mock endpoint in
 
 ```python
 import itertools
-import pyarrow as pa
+import duckdb
 import arrow2xmla as ax
+
+con = duckdb.connect()
 
 def answer(body: bytes):
     """-> (HTTP status, an iterable of bytes)"""
@@ -138,11 +152,11 @@ def answer(body: bytes):
     session = "new-id" if request.session.kind is ax.SessionKind.BEGIN else request.session.id
     match request.call:
         case ax.Discover(request_type="MDSCHEMA_CUBES"):
-            rows = ax.Rowset.from_columns({"CUBE_NAME": pa.array(["Sales"]), "CUBE_TYPE": pa.array(["CUBE"])})
+            rows = ax.Rowset.from_columns(ax.columns(con.sql("select 'Sales' as CUBE_NAME, 'CUBE' as CUBE_TYPE")))
             return 200, [ax.Envelope(ax.Method.DISCOVER, session).wrap(rows.to_xml())]
         case ax.Execute(statement=mdx):
             envelope = ax.Envelope(ax.Method.EXECUTE, session)
-            cellset = run(mdx)  # your engine: an ax.Cellset over its Arrow results
+            cellset = run(mdx)  # your engine: an ax.Cellset over its results, e.g. ax.columns(con.sql(...))
             return 200, itertools.chain([envelope.head()], cellset.iter_xml(), [envelope.tail()])   # lazy: ~1 MB in memory
     return 500, [ax.fault("not supported", session=session)]
 ```
