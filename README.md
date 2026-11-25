@@ -26,6 +26,26 @@ A pivot of 490 000 rows × 3 measures is **296 MB of XML**. arrow2xmla writes it
 | **arrow2xmla, 1 thread** | **81 ms** | **3.6 GB/s** | **16×** |
 | **arrow2xmla, all cores** (`threads=0`) | **23 ms** | **12.8 GB/s** | **57×** |
 
+### From DuckDB
+
+The same pivot straight from a DuckDB query (500 000 customers × 3 measures, the All row first and the customers sorted: a
+**330 MB** answer), measured from the query to the finished XML:
+
+| Route | Time | Throughput |
+|---|---:|---:|
+| `ax.columns(rel)` → `cellset.write_to(sink)`, streamed | **32 ms** | **10.4 GB/s** |
+| `ax.columns(rel)` → `cellset.iter_xml()`, streamed | 34 ms | 9.8 GB/s |
+| `rel.to_arrow_table()` → `cellset.to_xml()` | 33 ms | 9.9 GB/s |
+| `ax.columns(rel)` → `cellset.to_xml()`, whole bytes | 38 ms | 8.7 GB/s |
+| `rel.fetchall()` → plain-Python writer | 1 538 ms | 0.2 GB/s |
+
+Of those 32 ms, DuckDB running the queries and `columns()` copying the result into arrays take about 13 ms (the sort and the
+second query for the All row are most of it; one unsorted query is 4.7 ms), and writing the XML takes about 20 ms. Streaming
+with `write_to` beats `to_xml()` by about 20% and holds about 1 MB instead of the whole answer. At 3 000 000 customers (a 2 GB
+answer) the routes take 190 to 240 ms. DuckDB's own threads matter: 1 thread 54 ms, 4 or more 37 ms.
+Reproduce with `uv run --with duckdb python benchmarks/duckdb_bench.py --rows 500000`; it checks that every route writes the
+same bytes (except the All row, whose parallel `sum` can differ in its last digits from run to run).
+
 More cases (`uv run pytest benchmarks --benchmark-only`, mean time per call):
 
 | Case | Answer | Time |
@@ -59,7 +79,7 @@ Arrow crates in it: arrays are read through the Arrow C interface.
 pip install arrow2xmla
 ```
 
-Python 3.10+, one `abi3` wheel per platform (Linux, macOS, Windows). **No Arrow library is needed.** Data comes in through the
+Python 3.10+, one `abi3` wheel per platform (Linux, macOS, Windows). Data comes in through the
 Arrow PyCapsule interface: `columns(table)` reads the columns of anything that exports `__arrow_c_stream__` (a DuckDB relation, a
 polars DataFrame, a pyarrow Table), and an array that exports `__arrow_c_array__` (pyarrow, nanoarrow, ...) is read in place.
 
@@ -72,7 +92,7 @@ arrow2xmla = { git = "https://github.com/bmsuisse/arrow2xmla", tag = "v0.2.0" }
 
 ## Quick start
 
-With DuckDB, no pyarrow. This is [`examples/quickstart.py`](examples/quickstart.py), which runs as it is
+With DuckDB. This is [`examples/quickstart.py`](examples/quickstart.py), which runs as it is
 (`uv run --with duckdb python examples/quickstart.py`); the snippet shortens its data and leaves out the request body.
 
 ```python
@@ -116,8 +136,17 @@ is read as a double, and a whole-number decimal or `HUGEINT` (a sum of integers)
 polars (`ax.columns(df)`) and pyarrow (`ax.columns(table)`), and arrays you already hold (`pa.array([...])`) go straight into
 `CellValues`.
 
-Tested with DuckDB 1.1.3, 1.2.2, 1.3.2, 1.4.4, 1.5.2 and 2.0.1, in an environment without pyarrow (CI runs the sample against
-several of them). Older DuckDB does not export Arrow streams.
+Tested with DuckDB 1.1.3, 1.2.2, 1.3.2, 1.4.4, 1.5.2 and 2.0.1 (CI runs the examples against several of them). Older DuckDB does not export Arrow streams.
+
+### Examples
+
+Each runs as it is with `uv run --with duckdb python examples/<name>.py`:
+
+- [`examples/quickstart.py`](examples/quickstart.py): a pivot answer from a DuckDB query, and a parsed request.
+- [`examples/streaming.py`](examples/streaming.py): a million customers written with `write_to` and `iter_xml`, with the time
+  and the memory it takes (`EXAMPLE_ROWS=20000` for a quick run).
+- [`examples/server.py`](examples/server.py): a complete XMLA endpoint over the standard library's `http.server`
+  (`python examples/server.py --port 8000`): sessions, the Discover rowsets, a streamed pivot, faults.
 
 ### In Rust
 
@@ -137,37 +166,37 @@ let xml = cellset.to_vec()?;   // or cellset.write_to(&mut writer), or write_chu
 ## A server
 
 The three writers (cellset, rowset, fault) and the envelope are all a server needs next to `parse_request`; what it
-answers with is up to it. This is the shape of one (the mock endpoint in
-[`tests/e2e/xmla_mock.py`](tests/e2e/xmla_mock.py) is a complete one, read by olap4j in the tests):
+answers with is up to it. [`examples/server.py`](examples/server.py) is a complete one in the standard library's
+`http.server` over an in-memory DuckDB table (`python examples/server.py --port 8000`): it answers the Discover requests
+Excel opens with, honours their restrictions, echoes sessions, streams the pivot of an Execute and answers a request it
+refuses with a fault. It does not parse MDX, which is the engine's job. Its core, abridged:
 
 ```python
-import itertools
-import duckdb
-import arrow2xmla as ax
-
-con = duckdb.connect()
-
-def answer(body: bytes):
-    """-> (HTTP status, an iterable of bytes)"""
+def answer(con, body: bytes):
+    """-> (HTTP status, a list of bytes, or an iterator of bytes to stream)"""
     try:
-        request = ax.parse_request(body, max_size=1 << 20)
+        request = ax.parse_request(body, max_size=MAX_REQUEST)
+        session = {ax.SessionKind.BEGIN: str(uuid.uuid4()), ax.SessionKind.USE: request.session.id}.get(request.session.kind)
+        match request.call:
+            case ax.Discover() as call:   # a rowset from a DuckDB query: Rowset.from_columns(ax.columns(con.sql(...)))
+                return 200, [ax.Envelope(ax.Method.DISCOVER, session).wrap(discover(con, call))]
+            case ax.Execute(statement=mdx):
+                envelope = ax.Envelope(ax.Method.EXECUTE, session)
+                chunks = pivot(con).iter_xml()   # your engine: the Cellset for the statement
+                first = next(chunks)             # whatever is wrong with the cellset is raised here, before anything is sent
+                return 200, itertools.chain([envelope.head(), first], chunks, [envelope.tail()])   # lazy: ~1 MB in memory
+        return 500, [ax.fault("only Discover and Execute are supported", session=session)]
     except ax.XmlaError as e:
-        return 500, [ax.fault(str(e))]
-    session = "new-id" if request.session.kind is ax.SessionKind.BEGIN else request.session.id
-    match request.call:
-        case ax.Discover(request_type="MDSCHEMA_CUBES"):
-            rows = ax.Rowset.from_columns(ax.columns(con.sql("select 'Sales' as CUBE_NAME, 'CUBE' as CUBE_TYPE")))
-            return 200, [ax.Envelope(ax.Method.DISCOVER, session).wrap(rows.to_xml())]
-        case ax.Execute(statement=mdx):
-            envelope = ax.Envelope(ax.Method.EXECUTE, session)
-            cellset = run(mdx)  # your engine: an ax.Cellset over its results, e.g. ax.columns(con.sql(...))
-            return 200, itertools.chain([envelope.head()], cellset.iter_xml(), [envelope.tail()])   # lazy: ~1 MB in memory
-    return 500, [ax.fault("not supported", session=session)]
+        return 500, [ax.fault(str(e), session=session)]
 ```
+
+The handler sends a list with a `Content-Length`, and an iterator as HTTP/1.1 chunked transfer, so a 300 MB answer is never
+whole in memory.
 
 ### Streaming
 
-`to_xml()` builds the whole answer (about twice its size in memory at the peak). For a big one:
+`to_xml()` builds the whole answer (about twice its size in memory at the peak). For a big one,
+[`examples/streaming.py`](examples/streaming.py) writes a million customers (505 MB) both ways and checks they are the same:
 
 ```python
 with open("answer.xml", "wb") as fp:
@@ -212,7 +241,7 @@ byte is written:
 |---|---|
 | `int8` … `int64`, `uint8` … `uint64` | `xsd:int`; `xsd:long` / `xsd:unsignedLong` when 32 bits do not hold the value |
 | `float16`, `float32`, `float64` | `xsd:double`, Python's shortest `repr` digits; `NaN`, `INF`, `-INF` |
-| `decimal32`/`64`/`128` (via `columns()`; DuckDB's `DECIMAL` and `HUGEINT`) | `xsd:int` / `xsd:long` when the scale is 0 and every value fits 64 bits, else `xsd:double` (the unscaled value divided by 10^scale) |
+| `decimal32`/`64`/`128` (DuckDB's `DECIMAL` and `HUGEINT`; as an array or through `columns()`) | `xsd:int` / `xsd:long` when the scale is 0 and every value fits 64 bits, else `xsd:double` (the unscaled value divided by 10^scale) |
 | `string`, `large_string`, `string_view` | `xsd:string`, escaped |
 | null | no value: the cell is left out |
 | anything else (bool, dates, 256-bit decimals, dictionaries, ...) | refused with `UnsupportedTypeError`, naming the column: cast it first |

@@ -56,7 +56,7 @@ def _plain(x: Any) -> Any:
         combined = x.combine_chunks()
         if hasattr(combined, "__arrow_c_array__"):
             return combined
-    if hasattr(x, "__arrow_c_stream__"):  # a polars Series, a one-column stream: read here, no Arrow library needed
+    if hasattr(x, "__arrow_c_stream__"):  # a polars Series, a one-column stream: read here
         columns = _native.read_stream(x)
         if len(columns) != 1 or columns[0][0] is not None:
             raise CellsetError("this is a table, not one column: take a column of it with `columns(table)[name]`")
@@ -65,8 +65,8 @@ def _plain(x: Any) -> Any:
 
 
 def columns(table: Any) -> dict[str, Any]:
-    """The columns of an Arrow table or stream by name, ready for `CellValues`, `LevelAxis` and `Rowset`. No Arrow library
-    is needed: anything that exports `__arrow_c_stream__` works (a DuckDB relation, a polars DataFrame, a pyarrow Table).
+    """The columns of an Arrow table or stream by name, ready for `CellValues`, `LevelAxis` and `Rowset`.
+    Anything that exports `__arrow_c_stream__` works (a DuckDB relation, a polars DataFrame, a pyarrow Table).
 
         columns(duckdb.sql("select name, sum(x) as total from t group by name"))["total"]
 

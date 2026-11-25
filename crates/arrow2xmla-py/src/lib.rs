@@ -108,6 +108,22 @@ fn import<'a>(obj: &Bound<'_, PyAny>, keep: &mut Keep) -> PyResult<Array<'a>> {
     if schema.release.is_none() || array.release.is_none() {
         return Err(bad("an Arrow array that was already released"));
     }
+    if !schema.format.is_null() {
+        // SAFETY: a format string of a schema that has not been released
+        if let Ok(format) = unsafe { CStr::from_ptr(schema.format) }.to_str() {
+            if parse_decimal(format).is_some() {
+                // a decimal array is read as `columns()` reads one: an int64 when whole and it fits, else a double
+                let mut acc = Acc::new(format, "")?;
+                acc.push_decimal(array)?;
+                let col = Py::new(obj.py(), acc.finish())?;
+                let r: &ArrowColumn = col.get();
+                // SAFETY: as above: the column is frozen and `keep` holds it
+                let r: &'a ArrowColumn = unsafe { &*(r as *const ArrowColumn) };
+                keep.capsules.push(col.into_any());
+                return Ok(r.array());
+            }
+        }
+    }
     import_raw(schema, array, keep)
 }
 
@@ -199,8 +215,8 @@ fn import_raw<'a>(schema: &ArrowSchema, array: &ArrowArray, keep: &mut Keep) -> 
 }
 
 // A stream of arrays (`__arrow_c_stream__`: a DuckDB relation, a polars Series, a pyarrow Table, ...) read into columns
-// this module owns: the batches are copied into one array per column, so no Arrow library is needed to cut a column out
-// of a table or to combine chunks.
+// this module owns: the batches are copied into one array per column, which is how a column is cut out of a table and
+// chunks are combined.
 #[repr(C)]
 struct ArrowArrayStream {
     get_schema: Option<unsafe extern "C" fn(*mut ArrowArrayStream, *mut ArrowSchema) -> i32>,

@@ -1,4 +1,4 @@
-"""A published wheel works: it imports, writes a cellset and parses a request. Needs only pyarrow."""
+"""A published wheel works: it imports, writes a cellset and parses a request. Its test data is pyarrow."""
 
 import pyarrow as pa
 import pytest

@@ -10,10 +10,10 @@
     )
     xml = cs.to_xml()
 
-Data comes in through the Arrow PyCapsule interface, and no Arrow library is needed or imported here. An array
-(`__arrow_c_array__`: pyarrow, nanoarrow, ...) is read in place; a table or stream (`__arrow_c_stream__`: a DuckDB relation,
-a polars DataFrame or Series, a pyarrow Table) is read with `columns(table)`, which gives its columns by name. The producer of an array is trusted to give buffers as long as it says: this is not a validator
-of untrusted Arrow memory.
+Data comes in through the Arrow PyCapsule interface. An array (`__arrow_c_array__`: pyarrow, nanoarrow, ...) is read in
+place; a table or stream (`__arrow_c_stream__`: a DuckDB relation, a polars DataFrame or Series, a pyarrow Table) is read
+with `columns(table)`, which gives its columns by name. The producer of an array is trusted to give buffers as long as it
+says: this is not a validator of untrusted Arrow memory.
 
 Everything this package refuses raises a subclass of `XmlaError` (itself a `ValueError`).
 """

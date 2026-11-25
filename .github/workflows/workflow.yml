@@ -95,8 +95,8 @@ jobs:
           python -m pip install --no-index --find-links dist arrow2xmla
           python -m pytest -q -rs
 
-  # the package needs no Arrow library: the DuckDB sample runs where pyarrow is not installed
-  no-pyarrow:
+  # run the examples against several DuckDB versions
+  samples:
     needs: wheels
     runs-on: ubuntu-latest
     strategy:
@@ -115,8 +115,8 @@ jobs:
       - run: |
           if [ "${{ matrix.duckdb }}" = latest ]; then python -m pip install duckdb; else python -m pip install "duckdb==${{ matrix.duckdb }}"; fi
           python -m pip install --no-index --find-links dist arrow2xmla
-          python -c "import importlib.util as u; assert u.find_spec('pyarrow') is None, 'pyarrow must not be installed'"
           python examples/quickstart.py
+          EXAMPLE_ROWS=20000 python examples/streaming.py
 
   olap4j:
     # an independent client (olap4j's XMLA driver, Java) and the XMLA schema read our answers from a mock endpoint

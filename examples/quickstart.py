@@ -1,4 +1,6 @@
-"""A pivot answer from DuckDB, no pyarrow: `uv run --with duckdb python examples/quickstart.py`.
+"""A pivot answer from DuckDB: the smallest end to end use of arrow2xmla.
+
+Run it with `uv run --with duckdb python examples/quickstart.py`.
 
 DuckDB runs the query and hands its result over as Arrow; arrow2xmla reads the columns from it and writes the cellset.
 """

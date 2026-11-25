@@ -2,14 +2,20 @@
 
 ## Unreleased
 
-- **No Arrow library needed.** `columns(table)` reads the columns of anything that exports `__arrow_c_stream__`: a DuckDB
-  relation, a polars DataFrame, a pyarrow Table. The batches are copied once into one array per column (`ArrowColumn`), which
-  `CellValues`, `LevelAxis` and `Rowset` take like any Arrow array. A polars Series or any one-column stream is now taken
-  directly (it needed pyarrow before). Floats, integers, text and decimals; anything else (dates, booleans, ...) raises
+- **Decimals as arrays.** A decimal array handed straight to `CellValues` or `Rowset` (DuckDB's `DECIMAL` and `HUGEINT` through `to_arrow_table()`, a pyarrow decimal array) is read like one from `columns()`: an int64 when whole and it fits, else a double.
+- `benchmarks/duckdb_bench.py`: the routes from a DuckDB query to XMLA, with the time of each stage.
+- The example server's listen queue is 128, not the standard library's 5 (it reset connections under concurrent clients).
+- **`columns(table)`** reads the columns of anything that exports an Arrow stream (`__arrow_c_stream__`): a DuckDB
+  relation, a polars DataFrame, a pyarrow Table. The batches are copied once into one array per column (`ArrowColumn`),
+  which `CellValues`, `LevelAxis` and `Rowset` take like any Arrow array. A polars Series or any one-column stream is
+  taken directly. Floats, integers, text and decimals; anything else (dates, booleans, ...) raises
   `UnsupportedTypeError` naming the column and saying to cast it in the query.
 - **DuckDB's `DECIMAL` and `HUGEINT`** (the types of literals, `sum` and `avg`) are read through `columns()`: a whole-number
   decimal as int64 when it fits, otherwise a double. No casts are needed in a query.
-- The sample is DuckDB (`examples/quickstart.py`), and CI runs it in an environment without pyarrow.
+- **Samples**, all on DuckDB, each runnable with `uv run --with duckdb python examples/<name>.py`: `quickstart.py` (a pivot
+  and a parsed request), `streaming.py` (a million customers written with `write_to` and `iter_xml`, with the time and the
+  memory it takes) and `server.py` (a complete XMLA endpoint over the standard library's `http.server`: sessions, the
+  Discover rowsets, a streamed pivot, faults). `tests/test_examples.py` runs them; CI runs them against several DuckDB versions.
 
 ## 0.2.0
 

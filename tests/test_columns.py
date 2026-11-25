@@ -1,4 +1,4 @@
-"""`columns(table)`: the columns of an Arrow table or stream, read without an Arrow library; and hostile streams."""
+"""`columns(table)`: the columns of an Arrow table or stream, read natively; and hostile streams."""
 
 import subprocess
 import sys
@@ -136,6 +136,22 @@ def test_a_decimal_column_over_many_batches() -> None:
     parts = [pa.table({"v": pa.array([Decimal(f"{i}.25") for i in range(n)], pa.decimal128(12, 2))}) for n in (3, 0, 5)]
     col = ax.columns(pa.concat_tables(parts))["v"]
     assert len(col) == 8 and col.type == "double"
+
+
+def test_a_decimal_array_given_directly_is_read_like_one_from_columns() -> None:
+    """DuckDB's HUGEINT (a sum of integers) and DECIMAL arrive as Arrow decimals, as a table or as an array."""
+    from decimal import Decimal
+
+    t = pa.table({"k": pa.array(["a", "b", "c"]), "v": pa.array([Decimal("1500.50"), None, Decimal("-2.25")], pa.decimal128(12, 2)), "n": pa.array([7, None, 9], pa.decimal128(38, 0))})
+    keys = pa.array(["a", "b", "c"])
+    direct = ax.Cellset("C", [ax.CellValues(t["v"].combine_chunks(), "0"), ax.CellValues(t["n"].combine_chunks(), "0")], ax.TupleAxis.from_tuples([[MS[0]], [MS[1]]]), ax.LevelAxis(M, keys))
+    cols = ax.columns(t)
+    via = ax.Cellset("C", [ax.CellValues(cols["v"], "0"), ax.CellValues(cols["n"], "0")], ax.TupleAxis.from_tuples([[MS[0]], [MS[1]]]), ax.LevelAxis(M, keys))
+    assert direct.to_xml() == via.to_xml()
+    xml = direct.to_xml().decode()
+    assert ">1500.5<" in xml and 'xsi:type="xsd:int">7<' in xml
+    with pytest.raises(ax.CellsetError, match="text"):
+        ax.Cellset("C", [ax.CellValues(pa.array([1.0, 2.0, 3.0]), "0")], ax.LevelAxis(M, t["v"].combine_chunks())).to_xml()
 
 
 def test_a_column_is_reusable_and_read_only() -> None:
@@ -291,12 +307,3 @@ def test_hostile_streams_are_errors_not_crashes() -> None:
         assert seen[mode].startswith(f"{mode} error"), seen[mode]
     assert "the producer says no" in seen["schema_error"] and "the producer says no" in seen["next_error"]
     assert out.stdout.strip().endswith("done")
-
-
-def test_the_duckdb_example_runs_and_says_what_it_should() -> None:
-    import pathlib
-
-    example = pathlib.Path(__file__).parents[1] / "examples" / "quickstart.py"
-    out = subprocess.run([sys.executable, str(example)], capture_output=True, text=True, timeout=120)
-    assert out.returncode == 0, out.stderr[-800:]
-    assert "bytes of XMLA" in out.stdout and "MDX: SELECT FROM [Sales]" in out.stdout

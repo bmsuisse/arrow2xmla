@@ -166,7 +166,7 @@ UNSUPPORTED = {
     "timestamp": pa.array([1, 2, None], pa.timestamp("us")),
     "time64": pa.array([1, 2, None], pa.time64("us")),
     "duration": pa.array([1, 2, None], pa.duration("s")),
-    "decimal128": pa.array([1, 2, None], pa.decimal128(10, 2)),
+    "decimal256": pa.array([1, 2, None], pa.decimal256(40, 2)),
     "binary": pa.array([b"a", b"b", None]),
     "large_binary": pa.array([b"a", b"b", None], pa.large_binary()),
     "list": pa.array([[1], [2], None]),
