@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Separate member captions.** `LevelAxis(..., captions=...)` (Rust: `LevelAxis::captions`; `from_dict`: `"captions"` in a
+  level) takes a text array of the same length as the keys for the captions. The keys are then written as given, only XML-escaped
+  with `]` doubled, so a caller can pass pre-escaped keys (`~empty`, `~~tilde`) and captions (`(empty)`). A null caption is
+  `blank_caption`. Without `captions` nothing changes: an empty key is `&[]` with an empty caption, `~tilde` stays as it is.
+- **Declared-only cell properties.** `CellProperty` (Rust: `CellProp`) gains `BACK_COLOR`, `FORE_COLOR`, `FONT_FLAGS`,
+  `FORMATTED_VALUE`, `FONT_NAME`, `FONT_SIZE`, `UPDATEABLE`, `ACTION_TYPE` and `CELL_ORDINAL`: named in `CellInfo` with
+  their XSD type, in the order listed (interleaved with `VALUE`, `FORMAT_STRING`, `LANGUAGE`), and never written in a cell.
+  A name in neither group is still refused. (`BACK_COLOR` and the others were refused before.)
 - **`ArrowColumn.slice(offset, length=None)`**: a copy of some rows of a column. One result can now give both the
   members and the cells, e.g. `cols["customer"].slice(1)` for a result whose first row is the All row.
 - **Sample: Databricks.** `examples/databricks.py` takes a query result from `arrowbricks` straight into `columns()`: one

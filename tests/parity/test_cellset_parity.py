@@ -195,3 +195,102 @@ def test_threads_do_not_change_a_byte() -> None:
     }  # fmt: skip
     one = cellset_xml(spec, threads=1)
     assert one == cellset_xml(spec, threads=3) == cellset_xml(spec, threads=0)
+
+
+CAPTION_KEYS = ["~empty", "~~tilde", "~tilde", "", "a]b", "x]]y", "a&b<c>", "é 日本", "tab\there", "it's \"q\"", "k\r\nn"]
+
+
+def level_spec(keys, captions, with_all, props, col, **level):
+    return {
+        "cube": CUBE.name,
+        "axes": [{"properties": list(props), "level": {"all": member_dict(all_member()) if with_all else None, "template": member_dict(value_member(H, "x")), "keys": pa.array(keys, type=pa.string()), "captions": None if captions is None else pa.array(captions, type=pa.string()), **level}}],
+        "slicer": [member_dict(measure_member("Sales"))], "columns": [(col, "0")],
+    }  # fmt: skip
+
+
+def level_expected(keys, captions, with_all, props, col, **level):
+    members_all = all_member() if with_all else None
+    light = query.LightAxis(value_member(H, "x"), members_all, keys, captions, **level)
+    first = members_all or value_member(H, keys[0])
+    return expected(CUBE, [[(first,)]], python_cells([(col, "0")]), [measure_member("Sales")], [props], ("VALUE", "FORMAT_STRING"), {0: light})
+
+
+@pytest.mark.parametrize("seed", range(30))
+@pytest.mark.parametrize("threads", [1, 3])
+def test_separate_captions(seed: int, threads: int) -> None:
+    rnd = random.Random(5000 + seed)
+    n = rnd.choice([1, 2, 9, 40])
+    keys = [rnd.choice(CAPTION_KEYS) + (str(i) if rnd.random() < 0.5 else "") for i in range(n)]
+    captions = [rnd.choice(CAPTION_KEYS + ["(empty)", "(blank)", "Acme & Co"]) for _ in range(n)]
+    for i in range(n):
+        if rnd.random() < 0.15:
+            keys[i] = None
+        if rnd.random() < 0.15:
+            captions[i] = None
+    with_all = rnd.random() < 0.6
+    props = rnd.choice([(), ("MEMBER_CAPTION", "MEMBER_UNIQUE_NAME"), ("MEMBER_UNIQUE_NAME", "PARENT_UNIQUE_NAME", "MEMBER_CAPTION")])
+    col = pa.array([float(i) for i in range(n + with_all)], type=pa.float64())
+    extra = {"blank_caption": rnd.choice(["(blank)", "(none) & <x>"])} if rnd.random() < 0.5 else {}
+    py = level_expected(keys, captions, with_all, props, col, **extra)
+    got = cellset_xml(level_spec(keys, captions, with_all, props, col, **extra), threads=threads).decode()
+    assert got == py
+
+
+def test_captions_in_parallel_chunks_do_not_change_a_byte() -> None:
+    n = 50_000
+    keys = [f"{CAPTION_KEYS[i % len(CAPTION_KEYS)]}{i}" for i in range(n)]
+    captions = [None if i % 7 == 0 else f"c{i} & <{i}> ]" for i in range(n)]
+    col = pa.array([i * 0.5 for i in range(n)])
+    spec = level_spec(keys, captions, False, ("MEMBER_CAPTION", "MEMBER_UNIQUE_NAME"), col)
+    py = level_expected(keys, captions, False, ("MEMBER_CAPTION", "MEMBER_UNIQUE_NAME"), col)
+    one = cellset_xml(spec, threads=1)
+    assert one.decode() == py
+    assert one == cellset_xml(spec, threads=3) == cellset_xml(spec, threads=0)
+
+
+def test_keys_are_written_as_given_without_captions() -> None:
+    """The default: no special handling of an empty key or one that starts with a tilde."""
+    col = pa.array([1.0, 2.0, 3.0])
+    out = cellset_xml(level_spec(["", "~tilde", "a]b"], None, False, ("MEMBER_CAPTION",), col), threads=1).decode()
+    assert f"<UName>{H}.&amp;[]</UName><Caption></Caption>" in out
+    assert f"<UName>{H}.&amp;[~tilde]</UName><Caption>~tilde</Caption>" in out
+    assert f"<UName>{H}.&amp;[a]]b]</UName><Caption>a]b</Caption>" in out
+
+
+def test_pre_escaped_keys_and_captions() -> None:
+    col = pa.array([1.0, 2.0, 3.0])
+    out = cellset_xml(level_spec(["~empty", "~~tilde", "ok"], ["(empty)", "~tilde", None], False, (), col), threads=1).decode()
+    assert f"<UName>{H}.&amp;[~empty]</UName><Caption>(empty)</Caption>" in out
+    assert f"<UName>{H}.&amp;[~~tilde]</UName><Caption>~tilde</Caption>" in out
+    assert f"<UName>{H}.&amp;[ok]</UName><Caption>(blank)</Caption>" in out
+
+
+def test_captions_must_match_the_keys() -> None:
+    col = pa.array([1.0, 2.0])
+    with pytest.raises(Exception, match="captions"):
+        cellset_xml(level_spec(["a", "b"], ["x"], False, (), col))
+    with pytest.raises(Exception, match="text"):
+        bad = level_spec(["a", "b"], None, False, (), col)
+        bad["axes"][0]["level"]["captions"] = pa.array([1, 2])
+        cellset_xml(bad)
+
+
+def test_declared_cell_properties_are_declared_and_not_written() -> None:
+    n = 5
+    col = pa.array([1.5, None, 3.0, 4.0, 5.0])
+    for cell_props in [
+        ("VALUE", "FORMAT_STRING", "LANGUAGE", "BACK_COLOR", "FORE_COLOR", "FONT_FLAGS"),
+        ("BACK_COLOR", "VALUE", "FORE_COLOR", "FORMAT_STRING", "FONT_FLAGS", "LANGUAGE"),
+        ("FORMATTED_VALUE", "FONT_NAME", "FONT_SIZE", "UPDATEABLE", "ACTION_TYPE", "CELL_ORDINAL", "VALUE"),
+        ("BACK_COLOR", "FORE_COLOR"),
+        ("FORMAT_STRING", "BACK_COLOR", "LANGUAGE"),
+    ]:
+        for threads in (1, 3):
+            spec = level_spec([f"k{i}" for i in range(n)], None, False, (), col)
+            spec["cell_properties"] = list(cell_props)
+            py = expected(CUBE, [[(value_member(H, "k0"),)]], python_cells([(col, "0")]), [measure_member("Sales")], [()], cell_props, {0: query.LightAxis(value_member(H, "x"), None, [f"k{i}" for i in range(n)])})
+            assert cellset_xml(spec, threads=threads).decode() == py
+    declared = cellset_xml({**spec, "cell_properties": ["VALUE", "BACK_COLOR", "FORMAT_STRING", "FONT_FLAGS"]}).decode()
+    assert '<CellInfo><Value name="VALUE"/><BackColor name="BACK_COLOR" type="xsd:unsignedInt"/><FormatString name="FORMAT_STRING" type="xsd:string"/><FontFlags name="FONT_FLAGS" type="xsd:int"/></CellInfo>' in declared
+    assert "<BackColor>" not in declared and "<FontFlags>" not in declared
+    assert '<Cell CellOrdinal="0"><Value xsi:type="xsd:double">1.5</Value><FormatString>0</FormatString></Cell>' in declared

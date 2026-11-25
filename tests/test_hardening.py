@@ -116,7 +116,7 @@ def test_spec_checks() -> None:
         ({**base, "language": True}, "LCID"),
         ({**base, "columns": [(pa.array([1.0]), "0", 1)]}, "pair"),
         ({**base, "columns": {}}, "pairs"),
-        ({**base, "cell_properties": ["BACK_COLOR"]}, "unknown cell property"),
+        ({**base, "cell_properties": ["BOGUS_PROPERTY"]}, "unknown cell property"),
         ({**base, "cell_properties": "VALUE"}, "sequence"),
     ]:
         with pytest.raises((ValueError, TypeError), match=match):

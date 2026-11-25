@@ -39,11 +39,23 @@ class MemberProperty(str, Enum):
 
 
 class CellProperty(str, Enum):
-    """What is written in each cell: only the properties this package produces."""
+    """The cell properties of `CellInfo`, in the order they are listed (a client asked for them in that order).
+    `VALUE`, `FORMAT_STRING` and `LANGUAGE` are written in each cell. The others are declared only: `CellInfo` names
+    them (with their XSD type) and no cell carries them, so a client that asked for them gets the declaration and the
+    defaults. A name in neither group is refused."""
 
     VALUE = "VALUE"
     FORMAT_STRING = "FORMAT_STRING"
     LANGUAGE = "LANGUAGE"
+    BACK_COLOR = "BACK_COLOR"  # declared only: BackColor, xsd:unsignedInt
+    FORE_COLOR = "FORE_COLOR"  # declared only: ForeColor, xsd:unsignedInt
+    FONT_FLAGS = "FONT_FLAGS"  # declared only: FontFlags, xsd:int
+    FORMATTED_VALUE = "FORMATTED_VALUE"  # declared only: FmtValue, xsd:string
+    FONT_NAME = "FONT_NAME"  # declared only: FontName, xsd:string
+    FONT_SIZE = "FONT_SIZE"  # declared only: FontSize, xsd:unsignedShort
+    UPDATEABLE = "UPDATEABLE"  # declared only: Updateable, xsd:unsignedInt
+    ACTION_TYPE = "ACTION_TYPE"  # declared only: ActionType, xsd:unsignedInt
+    CELL_ORDINAL = "CELL_ORDINAL"  # declared only: CellOrdinal, xsd:unsignedInt
 
 
 def _plain(x: Any) -> Any:
@@ -237,13 +249,19 @@ class Member:
 class LevelAxis:
     """The values of one hierarchy's level, read from a text array: nothing is built per value (the fast form for
     big axes). A value's unique name is `<hierarchy>.&[<key>]` (`]` doubled), its caption the key; a null key is the
-    blank member."""
+    blank member.
+
+    `captions`: an optional second text array of the same length, the caption of each member. Then the keys are written
+    exactly as given (only XML-escaped, `]` doubled): an empty key is `&[]` and `~tilde` stays `~tilde`, so a caller that
+    wants its own escaping (`~empty`, `~~tilde`) passes the keys already escaped, and the captions (`(empty)`) itself.
+    A null caption is `blank_caption`; a null key is still the key `""`."""
 
     template: Member  # hierarchy, level_name, level_number, parent_unique_name, children_cardinality, member_type
     keys: Any  # an Arrow text array (string, large_string or string_view)
     all: Member | None = None  # the All member, shown first
     blank_caption: str = "(blank)"
     properties: tuple[MemberProperty, ...] = ()
+    captions: Any = None  # an Arrow text array as long as `keys`: each member's caption; None: the key is the caption
 
     def __post_init__(self) -> None:
         if not isinstance(self.template, Member):
@@ -253,6 +271,8 @@ class LevelAxis:
         if not isinstance(self.blank_caption, str):
             raise TypeError("LevelAxis.blank_caption is a str")
         _set(self, "keys", _plain(self.keys))
+        if self.captions is not None:
+            _set(self, "captions", _plain(self.captions))
         _set(self, "properties", _enums(MemberProperty, self.properties, "member properties", "member property"))
 
 
@@ -452,11 +472,11 @@ def _axis_from(d: Any) -> LevelAxis | TupleAxis:
         if "tuples" in d or "members" in d:
             raise CellsetError("an axis is a level or tuples, not both")
         lv = d["level"]
-        _only(lv, ("template", "keys", "all", "blank_caption"), "a level")
+        _only(lv, ("template", "keys", "all", "blank_caption", "captions"), "a level")
         if "template" not in lv or "keys" not in lv:
             raise CellsetError("a level needs 'template' and 'keys'")
         a = lv.get("all")
-        return LevelAxis(_member_from(lv["template"]), lv["keys"], None if a is None else _member_from(a), lv.get("blank_caption", "(blank)"), props)
+        return LevelAxis(_member_from(lv["template"]), lv["keys"], None if a is None else _member_from(a), lv.get("blank_caption", "(blank)"), props, lv.get("captions"))
     if "tuples" not in d:
         raise CellsetError("an axis needs 'level' or 'tuples'")
     if "members" in d:

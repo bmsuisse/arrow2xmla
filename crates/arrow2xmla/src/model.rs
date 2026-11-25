@@ -134,6 +134,8 @@ impl MemberProp {
 /// The members of one hierarchy's level read from an Arrow string column, in order, optionally after its All member.
 /// Nothing is built per value: the text of each member is written from the column. The unique name of a value is
 /// `<hierarchy>.&[<key>]` (`]` doubled), its caption the key, a null one has the key "" and `blank_caption`.
+/// With `captions` the caption comes from its own column and the key is written as given (only XML-escaped, `]`
+/// doubled): a caller that wants `~empty` for an empty key or `~~tilde` for `~tilde` passes them itself.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct LevelAxis<'a> {
@@ -144,14 +146,17 @@ pub struct LevelAxis<'a> {
     pub template: Member,
     /// A text array (`Utf8`, `LargeUtf8` or `Utf8View`).
     pub keys: Array<'a>,
-    /// The caption of a null key.
+    /// The caption of a null key (of a null caption when `captions` is set).
     pub blank_caption: String,
+    /// A text array of the same length as `keys`: each member's caption. A null caption is `blank_caption`; a null
+    /// key is still the key "". `None`: the caption is the key.
+    pub captions: Option<Array<'a>>,
 }
 
 impl<'a> LevelAxis<'a> {
     /// The values of `keys` as members made after `template`; no All member, blank caption `(blank)`.
     pub fn new(template: Member, keys: Array<'a>) -> Self {
-        Self { all: None, template, keys, blank_caption: "(blank)".into() }
+        Self { all: None, template, keys, blank_caption: "(blank)".into(), captions: None }
     }
 }
 
@@ -225,7 +230,9 @@ impl<'a> Axis<'a> {
     }
 }
 
-/// A cell property written in each cell (declared in the header). Only the ones a writer produces are listed.
+/// A cell property declared in the header (`CellInfo`), in the order the caller lists them. `Value`, `FormatString`
+/// and `Language` are also written in each cell; the others are declared only (see `is_written`): a client that
+/// asked for them gets the declaration and the defaults.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CellProp {
@@ -235,6 +242,24 @@ pub enum CellProp {
     FormatString,
     /// `LANGUAGE`: the LCID of the cellset.
     Language,
+    /// `BACK_COLOR` (declared only).
+    BackColor,
+    /// `FORE_COLOR` (declared only).
+    ForeColor,
+    /// `FONT_FLAGS` (declared only).
+    FontFlags,
+    /// `FORMATTED_VALUE` (declared only).
+    FormattedValue,
+    /// `FONT_NAME` (declared only).
+    FontName,
+    /// `FONT_SIZE` (declared only).
+    FontSize,
+    /// `UPDATEABLE` (declared only).
+    Updateable,
+    /// `ACTION_TYPE` (declared only).
+    ActionType,
+    /// `CELL_ORDINAL` (declared only).
+    CellOrdinal,
 }
 
 impl CellProp {
@@ -244,7 +269,22 @@ impl CellProp {
             Self::Value => "VALUE",
             Self::FormatString => "FORMAT_STRING",
             Self::Language => "LANGUAGE",
+            Self::BackColor => "BACK_COLOR",
+            Self::ForeColor => "FORE_COLOR",
+            Self::FontFlags => "FONT_FLAGS",
+            Self::FormattedValue => "FORMATTED_VALUE",
+            Self::FontName => "FONT_NAME",
+            Self::FontSize => "FONT_SIZE",
+            Self::Updateable => "UPDATEABLE",
+            Self::ActionType => "ACTION_TYPE",
+            Self::CellOrdinal => "CELL_ORDINAL",
         }
+    }
+
+    /// Whether the property is written in each cell (`Value`, `FormatString`, `Language`); the others are only
+    /// declared in the header.
+    pub fn is_written(self) -> bool {
+        matches!(self, Self::Value | Self::FormatString | Self::Language)
     }
 
     /// The element it is written as.
@@ -253,6 +293,15 @@ impl CellProp {
             Self::Value => "Value",
             Self::FormatString => "FormatString",
             Self::Language => "Language",
+            Self::BackColor => "BackColor",
+            Self::ForeColor => "ForeColor",
+            Self::FontFlags => "FontFlags",
+            Self::FormattedValue => "FmtValue",
+            Self::FontName => "FontName",
+            Self::FontSize => "FontSize",
+            Self::Updateable => "Updateable",
+            Self::ActionType => "ActionType",
+            Self::CellOrdinal => "CellOrdinal",
         }
     }
 
@@ -261,16 +310,28 @@ impl CellProp {
         match self {
             Self::Value => None,
             Self::FormatString => Some("xsd:string"),
-            Self::Language => Some("xsd:unsignedInt"),
+            Self::Language | Self::BackColor | Self::ForeColor | Self::Updateable | Self::ActionType | Self::CellOrdinal => Some("xsd:unsignedInt"),
+            Self::FontFlags => Some("xsd:int"),
+            Self::FormattedValue | Self::FontName => Some("xsd:string"),
+            Self::FontSize => Some("xsd:unsignedShort"),
         }
     }
 
-    /// From the MDX name; `None` for a property this crate does not write.
+    /// From the MDX name; `None` for a property that is neither written nor declared by this crate.
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "VALUE" => Self::Value,
             "FORMAT_STRING" => Self::FormatString,
             "LANGUAGE" => Self::Language,
+            "BACK_COLOR" => Self::BackColor,
+            "FORE_COLOR" => Self::ForeColor,
+            "FONT_FLAGS" => Self::FontFlags,
+            "FORMATTED_VALUE" => Self::FormattedValue,
+            "FONT_NAME" => Self::FontName,
+            "FONT_SIZE" => Self::FontSize,
+            "UPDATEABLE" => Self::Updateable,
+            "ACTION_TYPE" => Self::ActionType,
+            "CELL_ORDINAL" => Self::CellOrdinal,
             _ => return None,
         })
     }
@@ -306,7 +367,7 @@ pub struct Cellset<'a> {
     pub axes: Vec<Axis<'a>>,
     /// The members the whole answer is cut by (`WHERE`).
     pub slicer: Vec<Member>,
-    /// What is written in each cell.
+    /// What is declared in `CellInfo`, in order; each cell carries only the written ones (`CellProp::is_written`).
     pub cell_properties: Vec<CellProp>,
     /// The grid of cells, column by column.
     pub columns: Vec<Column<'a>>,

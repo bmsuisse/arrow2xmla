@@ -292,7 +292,7 @@ is offered the rest; closing or dropping the iterator stops the writer.
 | Piece | What it is |
 |---|---|
 | `Member` | One member: a value of a field, its All member, a measure. `MemberType` says which. |
-| `LevelAxis` | The values of **one level**, read from an Arrow text column. The fast form for big axes: unique name `<hierarchy>.&[key]` and caption are made from the key; a null key is the blank member. Optional All member. |
+| `LevelAxis` | The values of **one level**, read from an Arrow text column. The fast form for big axes: unique name `<hierarchy>.&[key]` and caption are made from the key; a null key is the blank member. Optional All member. Optional `captions` column: a caption per member, with the keys then written exactly as given (see below). |
 | `TupleAxis` | **Explicit tuples**: the distinct members once, each tuple as indices into them. `from_tuples` builds one from tuples of members. `DISPLAY_INFO` (children, drilled down, same parent) is worked out for you. |
 | `CellValues` | One **column of cells**: an Arrow array and its number format. A null is a cell with no value. |
 | `Rowset` | The answer to a `Discover`: Arrow columns written with the schema block clients read the column types from (`RowsetColumn` to override a type, e.g. `xsd:boolean`). |
@@ -319,8 +319,31 @@ byte is written:
 | anything else (bool, dates, 256-bit decimals, dictionaries, ...) | refused with `UnsupportedTypeError`, naming the column: cast it first |
 
 Characters XML 1.0 forbids are replaced with U+FFFD, so Excel's parser accepts the answer. Chunked arrays are combined
-first. Only `VALUE`, `FORMAT_STRING` and `LANGUAGE` are written in a cell (`CellProperty`); a property that is not
-written is not accepted, rather than silently left blank.
+first. Of the cell properties (`CellProperty`), `VALUE`, `FORMAT_STRING` and `LANGUAGE` are written in each cell. `BACK_COLOR`,
+`FORE_COLOR`, `FONT_FLAGS`, `FORMATTED_VALUE`, `FONT_NAME`, `FONT_SIZE`, `UPDATEABLE`, `ACTION_TYPE` and `CELL_ORDINAL` are
+declared only: `CellInfo` names them, with their XSD type, and no cell carries them (a client that asked for them gets
+the defaults). `CellInfo` lists them in the order of `cell_properties`, interleaved with the written ones. A name in
+neither group is refused, rather than silently left blank.
+
+```python
+# what Excel asks: CELL PROPERTIES VALUE, FORMAT_STRING, LANGUAGE, BACK_COLOR, FORE_COLOR, FONT_FLAGS
+Cellset(..., cell_properties=["VALUE", "FORMAT_STRING", "LANGUAGE", "BACK_COLOR", "FORE_COLOR", "FONT_FLAGS"])
+```
+
+### Member captions and keys
+
+By default a level's member has its unique name `<hierarchy>.&[key]` and its caption both made from the one text column:
+an empty key is `&[]` with an empty caption, `~tilde` stays `~tilde`. Pass `captions` (a text array of the same length;
+a null caption is `blank_caption`) to give each caption its own column. The keys are then written as given, with only the
+XML escaping and `]` doubled to `]]`, so a caller with its own key rules passes the keys already escaped:
+
+```python
+keys = pa.array(["~empty", "~~tilde", "Acme"])          # '' and '~tilde', escaped by the caller
+captions = pa.array(["(empty)", "~tilde", None])        # None: blank_caption
+LevelAxis(customer, keys, captions=captions)           # &[~empty] "(empty)", &[~~tilde] "~tilde", &[Acme] "(blank)"
+```
+
+In Rust: `level.captions = Some(Array::new(...))`; `cs.cell_properties = vec![CellProp::Value, CellProp::BackColor, ...]`.
 
 ### Requests
 

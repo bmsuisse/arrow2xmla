@@ -674,6 +674,10 @@ fn axis<'a>(o: &Bound<'_, PyAny>, keep: &mut Keep) -> PyResult<Axis<'a>> {
         let mut level = LevelAxis::new(member(&attr(o, "template")?)?, import(&attr(o, "keys")?, keep)?);
         level.all = if all.is_none() { None } else { Some(member(&all)?) };
         level.blank_caption = attr(o, "blank_caption")?.extract()?;
+        let captions = attr(o, "captions")?;
+        if !captions.is_none() {
+            level.captions = Some(import(&captions, keep)?);
+        }
         Axis::level(level)
     } else {
         // a TupleAxis: the distinct members once, each tuple as indices into them
@@ -693,7 +697,7 @@ fn build<'a>(cellset: &Bound<'_, PyAny>, keep: &mut Keep) -> PyResult<Cellset<'a
     cs.language = attr(cellset, "language")?.extract()?;
     cs.cell_properties = names(&attr(cellset, "cell_properties")?)?
         .iter()
-        .map(|n| CellProp::from_name(n).ok_or_else(|| CellsetError::new_err(format!("unknown cell property {n} (written: VALUE, FORMAT_STRING, LANGUAGE)"))))
+        .map(|n| CellProp::from_name(n).ok_or_else(|| CellsetError::new_err(format!("unknown cell property {n} (written: VALUE, FORMAT_STRING, LANGUAGE; declared only: BACK_COLOR, FORE_COLOR, FONT_FLAGS, FORMATTED_VALUE, FONT_NAME, FONT_SIZE, UPDATEABLE, ACTION_TYPE, CELL_ORDINAL)"))))
         .collect::<PyResult<_>>()?;
     for name in ["columns_axis", "rows_axis"] {
         let a = attr(cellset, name)?;

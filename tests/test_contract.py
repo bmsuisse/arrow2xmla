@@ -23,6 +23,22 @@ def test_every_cell_property_is_known_to_the_core(p: ax.CellProperty) -> None:
     assert f'name="{p.value}"' in cellset(cell_properties=[p]).to_xml().decode()
 
 
+def test_a_level_axis_takes_captions_directly() -> None:
+    axis = ax.LevelAxis(M, pa.array(["~empty", "~~t"]), captions=pa.array(["(empty)", None]), blank_caption="-")
+    xml = ax.Cellset("C", [ax.CellValues(pa.array([1.0, 2.0]), "0")], axis).to_xml().decode()
+    assert "<UName>[H].&amp;[~empty]</UName><Caption>(empty)</Caption>" in xml
+    assert "<UName>[H].&amp;[~~t]</UName><Caption>-</Caption>" in xml
+    with pytest.raises(ax.CellsetError, match="captions"):
+        ax.Cellset("C", [ax.CellValues(pa.array([1.0]), "0")], ax.LevelAxis(M, pa.array(["a"]), captions=pa.array(["x", "y"]))).to_xml()
+
+
+def test_declared_cell_properties_keep_the_listed_order() -> None:
+    props = [ax.CellProperty.BACK_COLOR, "VALUE", "FORE_COLOR", ax.CellProperty.FORMAT_STRING, "FONT_FLAGS"]
+    xml = cellset(cell_properties=props).to_xml().decode()
+    assert xml.index('name="BACK_COLOR"') < xml.index('name="VALUE"') < xml.index('name="FORE_COLOR"') < xml.index('name="FORMAT_STRING"') < xml.index('name="FONT_FLAGS"')
+    assert "<BackColor>" not in xml
+
+
 @pytest.mark.parametrize("t", list(ax.MemberType))
 def test_every_member_type_is_known_to_the_core(t: ax.MemberType) -> None:
     m = ax.Member("[H]", "[H].[L]", 1, member_type=t)

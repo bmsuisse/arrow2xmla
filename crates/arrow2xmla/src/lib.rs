@@ -180,11 +180,52 @@ mod tests {
                 template: member("[T].[F]"),
                 keys: Array::new(Values::Utf8 { offsets, data }),
                 blank_caption: "(blank)".into(),
+                captions: None,
             })),
             properties: vec![MemberProp::MemberCaption],
         });
         cs.columns.push(Column { values: Array::new(Values::F64(floats)), format: "0".into() });
         cs
+    }
+
+    #[test]
+    fn captions_come_from_their_own_column_and_keys_are_written_as_given() {
+        let (k_off, k_data) = text(&["", "~tilde", "a]b", "~empty"]);
+        let (c_off, c_data) = text(&["(empty)", "T & Co", "", "x"]);
+        let floats = [1.0, 2.0, 3.0, 4.0];
+        let mut cs = cellset(&k_off, &k_data, &floats);
+        let AxisSource::Level(level) = &mut cs.axes[0].source else { unreachable!() };
+        level.captions = Some(Array::new(Values::Utf8 { offsets: &c_off, data: &c_data }));
+        for threads in [1, 3] {
+            let mut v = Vec::new();
+            cs.write_chunks(WriteOptions::with_threads(threads), &mut |c| {
+                v.extend_from_slice(&c);
+                Ok(())
+            })
+            .unwrap();
+            let xml = String::from_utf8(v).unwrap();
+            assert!(xml.contains("<UName>[T].[F].&amp;[]</UName><Caption>(empty)</Caption>"));
+            assert!(xml.contains("<UName>[T].[F].&amp;[~tilde]</UName><Caption>T &amp; Co</Caption>"));
+            assert!(xml.contains("<UName>[T].[F].&amp;[a]]b]</UName><Caption></Caption>"));
+            assert!(xml.contains("<MEMBER_UNIQUE_NAME>[T].[F].&amp;[~empty]</MEMBER_UNIQUE_NAME>") || xml.contains("<UName>[T].[F].&amp;[~empty]</UName>"));
+        }
+        let (short_off, short_data) = text(&["x"]);
+        let AxisSource::Level(level) = &mut cs.axes[0].source else { unreachable!() };
+        level.captions = Some(Array::new(Values::Utf8 { offsets: &short_off, data: &short_data }));
+        assert!(cs.validate().unwrap_err().to_string().contains("captions"));
+    }
+
+    #[test]
+    fn declared_cell_properties_are_listed_in_order_and_not_written_per_cell() {
+        let (offsets, data) = text(&["a"]);
+        let mut cs = cellset(&offsets, &data, &[1.5]);
+        cs.cell_properties = vec![CellProp::Value, CellProp::BackColor, CellProp::FormatString, CellProp::FontFlags, CellProp::Language];
+        let xml = String::from_utf8(cs.to_vec().unwrap()).unwrap();
+        assert!(xml.contains("<CellInfo><Value name=\"VALUE\"/><BackColor name=\"BACK_COLOR\" type=\"xsd:unsignedInt\"/><FormatString name=\"FORMAT_STRING\" type=\"xsd:string\"/><FontFlags name=\"FONT_FLAGS\" type=\"xsd:int\"/><Language name=\"LANGUAGE\" type=\"xsd:unsignedInt\"/></CellInfo>"));
+        assert!(xml.contains("<Cell CellOrdinal=\"0\"><Value xsi:type=\"xsd:double\">1.5</Value><FormatString>0</FormatString><Language>1033</Language></Cell>"));
+        assert!(!xml.contains("<BackColor>") && !xml.contains("<FontFlags>"));
+        assert_eq!(CellProp::from_name("FONT_SIZE").map(CellProp::xsd_type), Some(Some("xsd:unsignedShort")));
+        assert!(CellProp::from_name("NOPE").is_none());
     }
 
     #[test]
