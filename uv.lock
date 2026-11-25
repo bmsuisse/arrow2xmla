@@ -10,12 +10,6 @@ resolution-markers = [
 name = "arrow2xmla"
 source = { editable = "." }
 
-[package.optional-dependencies]
-pyarrow = [
-    { name = "pyarrow", version = "25.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "pyarrow", version = "26.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-]
-
 [package.dev-dependencies]
 dev = [
     { name = "maturin" },
@@ -26,8 +20,6 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pyarrow", marker = "extra == 'pyarrow'", specifier = ">=15" }]
-provides-extras = ["pyarrow"]
 
 [package.metadata.requires-dev]
 dev = [

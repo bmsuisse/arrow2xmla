@@ -1,7 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
+- **Removed:** the optional `pyarrow` extra (`pip install arrow2xmla[pyarrow]`): nothing in the package needs it.
 - **Decimals as arrays.** A decimal array handed straight to `CellValues` or `Rowset` (DuckDB's `DECIMAL` and `HUGEINT` through `to_arrow_table()`, a pyarrow decimal array) is read like one from `columns()`: an int64 when whole and it fits, else a double.
 - `benchmarks/duckdb_bench.py`: the routes from a DuckDB query to XMLA, with the time of each stage.
 - The example server's listen queue is 128, not the standard library's 5 (it reset connections under concurrent clients).

@@ -18,9 +18,6 @@ classifiers = [
 ]
 dependencies = []  # none: Arrow arrays are read through the PyCapsule interface
 
-[project.optional-dependencies]
-pyarrow = ["pyarrow>=15"]  # for chunked arrays and Arrow streams; any other Arrow library works as well
-
 [project.urls]
 Homepage = "https://github.com/bmsuisse/arrow2xmla"
 Repository = "https://github.com/bmsuisse/arrow2xmla"
